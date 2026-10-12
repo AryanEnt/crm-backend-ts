@@ -1,0 +1,25 @@
+DROP INDEX IF EXISTS customers_source_created_idx;
+DROP INDEX IF EXISTS customers_anzsco_idx;
+DROP INDEX IF EXISTS activities_completed_at_idx;
+DROP INDEX IF EXISTS activities_kind_created_idx;
+DROP INDEX IF EXISTS activities_owner_created_idx;
+DROP INDEX IF EXISTS activities_created_at_idx;
+DROP INDEX IF EXISTS deal_stage_transitions_pipeline_exited_idx;
+DROP INDEX IF EXISTS deal_stage_transitions_to_exited_idx;
+DROP INDEX IF EXISTS deal_stage_transitions_from_exited_idx;
+DROP INDEX IF EXISTS leads_converted_at_idx;
+DROP INDEX IF EXISTS leads_team_created_idx;
+DROP INDEX IF EXISTS leads_owner_created_idx;
+DROP INDEX IF EXISTS leads_pipeline_stage_status_idx;
+DROP INDEX IF EXISTS deals_source_created_idx;
+DROP INDEX IF EXISTS deals_team_created_idx;
+DROP INDEX IF EXISTS deals_owner_created_idx;
+DROP INDEX IF EXISTS deals_created_at_idx;
+DROP INDEX IF EXISTS deals_pipeline_stage_status_idx;
+
+DELETE FROM activities WHERE subject LIKE 'Seed follow-up%';
+DELETE FROM deal_stage_transitions WHERE deal_id IN (SELECT id FROM deals WHERE source = 'analytics_seed');
+DELETE FROM deals WHERE source = 'analytics_seed';
+DELETE FROM customers WHERE id = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbb1';
+DELETE FROM team_members WHERE team_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1';
+DELETE FROM teams WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1';

@@ -1,0 +1,17 @@
+node_modules
+dist
+coverage
+storage
+test
+.env
+.env.*
+!.env.example
+*.log
+.git
+.vscode
+.idea
+Dockerfile
+.dockerignore
+*.md
+.kysely-codegenrc.json
+vitest.config.*
