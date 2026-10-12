@@ -15,12 +15,14 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM node:24-alpine
 ENV NODE_ENV=production \
-    APP_ENV=production
+    APP_ENV=production \
+    STORAGE_ROOT=/app/storage
 WORKDIR /app
 COPY --chown=node:node package.json ./
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node migrations ./migrations
+RUN mkdir -p /app/storage && chown node:node /app/storage
 USER node
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

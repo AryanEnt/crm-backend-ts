@@ -35,10 +35,16 @@ Reference the existing Postgres and Go services instead of copying values.
 | `FRONTEND_URL`             | Frontend origin(s), comma-separated                                |
 | `PUBLIC_API_URL`           | This service's public URL, e.g. `https://${{RAILWAY_PUBLIC_DOMAIN}}` |
 | `GO_BACKEND_URL`           | Switch-over only: `http://${{<go-service>.RAILWAY_PRIVATE_DOMAIN}}:${{<go-service>.PORT}}` |
-| `STORAGE_ROOT`             | Mount path of this service's volume, e.g. `/data/storage`          |
+| `STORAGE_ROOT`             | `/data/storage` when this service has a volume mounted at `/data`; otherwise `/app/storage` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GMAIL_PUBSUB_TOPIC` | Same as Go, when used |
 
 `PORT` is injected by Railway; do not set it.
+
+Do not point `STORAGE_ROOT` at a sibling service's directory (for example
+`../backend/storage`). Each Railway service has its own filesystem. For persistent
+uploads, mount a volume on the TS service at `/data` and set `STORAGE_ROOT=/data/storage`;
+without a volume, use `/app/storage` (writable by the container's `node` user, but
+ephemeral across redeploys).
 
 `JWT_SECRET` must match so sessions carry over, and `TOKEN_ENCRYPTION_KEY` (or
 `JWT_SECRET`, its fallback) must match so the Gmail tokens Go stored can be decrypted.
