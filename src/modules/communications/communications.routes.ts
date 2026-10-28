@@ -40,8 +40,35 @@ const createAccountSchema = z.strictObject({
   isActive: optionalBool(),
 });
 
+const connectWhatsAppSchema = z.strictObject({
+  name: str(),
+  displayIdentifier: str(),
+  externalAccountId: str(),
+  accessToken: str(),
+  appSecret: str(),
+  verifyToken: str(),
+  graphApiVersion: str(),
+});
+
+const embeddedSignupSchema = z.strictObject({
+  code: str(),
+  phoneNumberId: str(),
+  wabaId: str(),
+  displayPhoneNumber: str(),
+});
+
 const sendWhatsAppSchema = z.strictObject({ accountId: str(), to: str(), body: str(), mediaUrl: str(), ...links });
 const placeCallSchema = z.strictObject({ accountId: str(), to: str(), ...links });
+const callPermissionSchema = z.strictObject({ accountId: str(), to: str(), body: str(), ...links });
+const initiateWaCallSchema = z.strictObject({
+  accountId: str(),
+  to: str(),
+  sdp: str(),
+  sdpType: str(),
+  ...links,
+});
+const waCallSignalSchema = z.strictObject({ sdp: str(), sdpType: str() });
+const emptyBodySchema = z.strictObject({});
 
 /** http.Error: plain text with a trailing newline and nosniff. */
 function httpError(res: Response, status: number, text: string): void {
@@ -90,12 +117,74 @@ export function communicationsRouter(service: CommunicationsService, guard: Guar
   });
 
   router.get(
+    "/api/v1/communications/whatsapp/connect-config",
+    ...guard(P.CommunicationsView, P.CommunicationsSend, P.CommunicationsManage),
+    async (_req, res) => {
+      ok(res, service.whatsappConnectConfig());
+    },
+  );
+
+  // One-click Embedded Signup (platform Meta app in env; SE only authorizes their number).
+  router.post(
+    "/api/v1/communications/whatsapp/embedded-signup",
+    ...guard(P.CommunicationsSend, P.CommunicationsManage),
+    jsonBody,
+    async (req, res) => {
+      const input = decodeJson(req, embeddedSignupSchema);
+      created(res, await service.completeEmbeddedSignup(claimsOf(req).userId, input, requestMeta(req)));
+    },
+  );
+
+  // Manual credentials connect (fallback when Embedded Signup env is not set).
+  router.post(
+    "/api/v1/communications/whatsapp/connect",
+    ...guard(P.CommunicationsSend, P.CommunicationsManage),
+    jsonBody,
+    async (req, res) => {
+      const input = decodeJson(req, connectWhatsAppSchema);
+      created(res, await service.connectWhatsApp(claimsOf(req).userId, input, requestMeta(req)));
+    },
+  );
+
+  router.post(
+    "/api/v1/communications/accounts/:id/disconnect",
+    ...guard(P.CommunicationsSend, P.CommunicationsManage),
+    jsonBody,
+    async (req, res) => {
+      decodeJson(req, emptyBodySchema);
+      const claims = claimsOf(req);
+      const canManage = claims.permissions.includes(P.CommunicationsManage);
+      ok(
+        res,
+        await service.disconnectAccount(claims.userId, String(req.params.id ?? ""), canManage, requestMeta(req)),
+      );
+    },
+  );
+
+  router.get(
+    "/api/v1/communications/whatsapp/conversations",
+    ...guard(P.CommunicationsView, P.CommunicationsSend),
+    async (req, res) => {
+      const [limit, offset] = page(req);
+      const { items, total } = await service.listWhatsAppConversations(queryParam(req, "q"), limit, offset);
+      listed(res, items, total, limit, offset);
+    },
+  );
+
+  router.get(
     "/api/v1/communications/whatsapp/messages",
     ...guard(P.CommunicationsView, P.CommunicationsSend),
     async (req, res) => {
       const [limit, offset] = page(req);
       const q = (k: string) => queryParam(req, k);
-      const { items, total } = await service.listWhatsApp(q("customerId"), q("dealId"), q("leadId"), limit, offset);
+      const { items, total } = await service.listWhatsApp(
+        q("customerId"),
+        q("dealId"),
+        q("leadId"),
+        q("conversationKey"),
+        limit,
+        offset,
+      );
       listed(res, items, total, limit, offset);
     },
   );
@@ -116,6 +205,89 @@ export function communicationsRouter(service: CommunicationsService, guard: Guar
     const input = decodeJson(req, placeCallSchema);
     created(res, await service.placeCall(claimsOf(req).userId, input, requestMeta(req)));
   });
+
+  router.get(
+    "/api/v1/communications/whatsapp/calls",
+    ...guard(P.CommunicationsView, P.CommunicationsSend),
+    async (req, res) => {
+      const [limit, offset] = page(req);
+      const q = (k: string) => queryParam(req, k);
+      const active = q("active") === "1" || q("active") === "true";
+      const { items, total } = await service.listWhatsAppCalls(
+        q("customerId"),
+        q("dealId"),
+        q("leadId"),
+        q("status"),
+        active,
+        limit,
+        offset,
+      );
+      listed(res, items, total, limit, offset);
+    },
+  );
+
+  router.get(
+    "/api/v1/communications/whatsapp/calls/:id",
+    ...guard(P.CommunicationsView, P.CommunicationsSend),
+    async (req, res) => {
+      ok(res, await service.getWhatsAppCall(String(req.params.id ?? "")));
+    },
+  );
+
+  router.post(
+    "/api/v1/communications/whatsapp/call-permission",
+    ...guard(P.CommunicationsSend),
+    jsonBody,
+    async (req, res) => {
+      const input = decodeJson(req, callPermissionSchema);
+      created(res, await service.requestCallPermission(claimsOf(req).userId, input, requestMeta(req)));
+    },
+  );
+
+  router.post("/api/v1/communications/whatsapp/calls", ...guard(P.CommunicationsSend), jsonBody, async (req, res) => {
+    const input = decodeJson(req, initiateWaCallSchema);
+    created(res, await service.initiateWhatsAppCall(claimsOf(req).userId, input, requestMeta(req)));
+  });
+
+  router.post(
+    "/api/v1/communications/whatsapp/calls/:id/pre-accept",
+    ...guard(P.CommunicationsSend),
+    jsonBody,
+    async (req, res) => {
+      const input = decodeJson(req, waCallSignalSchema);
+      ok(res, await service.preAcceptWhatsAppCall(claimsOf(req).userId, String(req.params.id ?? ""), input, requestMeta(req)));
+    },
+  );
+
+  router.post(
+    "/api/v1/communications/whatsapp/calls/:id/accept",
+    ...guard(P.CommunicationsSend),
+    jsonBody,
+    async (req, res) => {
+      const input = decodeJson(req, waCallSignalSchema);
+      ok(res, await service.acceptWhatsAppCall(claimsOf(req).userId, String(req.params.id ?? ""), input, requestMeta(req)));
+    },
+  );
+
+  router.post(
+    "/api/v1/communications/whatsapp/calls/:id/reject",
+    ...guard(P.CommunicationsSend),
+    jsonBody,
+    async (req, res) => {
+      decodeJson(req, emptyBodySchema);
+      ok(res, await service.rejectWhatsAppCall(claimsOf(req).userId, String(req.params.id ?? ""), requestMeta(req)));
+    },
+  );
+
+  router.post(
+    "/api/v1/communications/whatsapp/calls/:id/terminate",
+    ...guard(P.CommunicationsSend),
+    jsonBody,
+    async (req, res) => {
+      decodeJson(req, emptyBodySchema);
+      ok(res, await service.terminateWhatsAppCall(claimsOf(req).userId, String(req.params.id ?? ""), requestMeta(req)));
+    },
+  );
 
   // Provider webhooks: public, authenticity validated per provider (no JWT).
   router.get("/api/v1/webhooks/meta/whatsapp", async (req, res) => {

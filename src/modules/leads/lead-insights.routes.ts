@@ -44,7 +44,7 @@ export function leadInsightsRouter(service: LeadInsightsService, guard: Guard): 
   });
 
   router.get("/api/v1/leads/insights/my-day", ...view, async (req, res) => {
-    const tz = queryParam(req, "tz").trim() || "UTC";
+    const tz = queryParam(req, "tz").trim() || "Asia/Kathmandu";
     if (!isValidTimezone(tz)) throw AppError.validation("invalid IANA timezone");
     ok(res, await service.myDay(insightScope(req, "me"), tz));
   });

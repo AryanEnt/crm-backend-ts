@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pipelineKindFor, TargetsService } from "../src/modules/targets/targets.service.js";
+import { activityKindFor, pipelineKindFor, TargetsService } from "../src/modules/targets/targets.service.js";
 import { fakeDb } from "./helpers/fake-db.js";
 
 describe("target pipeline filter", () => {
@@ -8,6 +8,14 @@ describe("target pipeline filter", () => {
     expect(pipelineKindFor("open_lead_value")).toBe("leads");
     expect(pipelineKindFor("won_revenue")).toBe("sales");
     expect(pipelineKindFor("activities")).toBeNull();
+    expect(pipelineKindFor("activities_calls")).toBeNull();
+    expect(pipelineKindFor("activities_meetings")).toBeNull();
+  });
+
+  it("maps activity metrics to a kind filter", () => {
+    expect(activityKindFor("activities")).toBe("");
+    expect(activityKindFor("activities_calls")).toBe("call");
+    expect(activityKindFor("activities_meetings")).toBe("meeting");
   });
 
   const check = (kind: string | null, metric: string, pipelineId: string | null = "p-1") => {

@@ -31,7 +31,7 @@ const stage = (id: string, name: string, position: number, extra: Partial<Stage>
   ...extra,
 });
 
-const COLD = stage("s-cold", "Cold lead", 1);
+const COLD = stage("s-cold", "Lead", 1);
 const CONTACTED = stage("s-contacted", "Contacted", 2);
 const QUALIFIED = stage("s-qualified", "Qualified", 3);
 const PROPOSAL = stage("s-proposal", "Proposal", 4);
@@ -40,7 +40,7 @@ const LOST = stage("s-lost", "Lost", 7, { isLost: true });
 const STAGES = [LOST, PROPOSAL, COLD, WON, QUALIFIED, CONTACTED];
 
 describe("promptTarget", () => {
-  it("moves a cold lead forward by stage name", () => {
+  it("moves a lead in the first stage forward by stage name", () => {
     expect(promptTarget(STAGES, COLD.id, PromptResult.Contacted)?.id).toBe(CONTACTED.id);
     expect(promptTarget(STAGES, COLD.id, PromptResult.Qualified)?.id).toBe(QUALIFIED.id);
     expect(promptTarget(STAGES, COLD.id, PromptResult.NotQualified)?.id).toBe(LOST.id);
@@ -159,7 +159,7 @@ describe("ActivityPromptsService.outcome", () => {
 });
 
 describe("ActivityPromptsService.contactMade", () => {
-  it("moves a cold lead to Contacted as a system move for the user", async () => {
+  it("moves a first-stage lead to Contacted as a system move for the user", async () => {
     const { svc, move } = setup();
     await expect(svc.contactMade("user-1", "lead-1", META)).resolves.toEqual({ stageId: CONTACTED.id, stageName: "Contacted" });
     expect(move).toHaveBeenCalledWith(

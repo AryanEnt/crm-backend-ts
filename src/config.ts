@@ -20,6 +20,14 @@ export interface Config {
   googleClientSecret: string;
   gmailPubSubTopic: string;
   tokenEncryptionKey: string;
+  /** Meta app for WhatsApp Embedded Signup (SE one-click connect). */
+  metaAppId: string;
+  metaAppSecret: string;
+  /** Embedded Signup configuration ID from the Meta App Dashboard. */
+  metaWhatsAppConfigId: string;
+  /** Shared webhook verify token used for all connected WhatsApp numbers. */
+  metaWhatsAppVerifyToken: string;
+  metaGraphApiVersion: string;
   /** Go backend that still serves routes not yet ported. Empty disables forwarding. */
   goBackendUrl: string;
   /**
@@ -82,6 +90,11 @@ export function loadConfig(): Config {
     googleClientSecret: env("GOOGLE_CLIENT_SECRET"),
     gmailPubSubTopic: env("GMAIL_PUBSUB_TOPIC"),
     tokenEncryptionKey: env("TOKEN_ENCRYPTION_KEY", jwtSecret),
+    metaAppId: env("META_APP_ID"),
+    metaAppSecret: env("META_APP_SECRET"),
+    metaWhatsAppConfigId: env("META_WHATSAPP_CONFIG_ID"),
+    metaWhatsAppVerifyToken: env("META_WHATSAPP_VERIFY_TOKEN"),
+    metaGraphApiVersion: env("META_GRAPH_API_VERSION", "v21.0"),
     goBackendUrl: env("GO_BACKEND_URL").replace(/\/+$/, ""),
     automationWorker: parseFlag("AUTOMATION_WORKER", env("GO_BACKEND_URL") === ""),
     emailWorker: parseFlag("EMAIL_WORKER", env("GO_BACKEND_URL") === ""),

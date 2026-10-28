@@ -363,13 +363,21 @@ export class ActivitiesRepository {
     status: string,
   ): Promise<void> {
     const ignore = () => undefined;
+    const open = status === "upcoming" || status === "due" || status === "overdue";
+    const closed = status === "completed" || status === "cancelled";
     if (lead !== null) {
       await sql`
         UPDATE leads SET
           status = CASE WHEN status = 'inbox' THEN 'open' ELSE status END,
           last_activity_at = CASE WHEN ${status}::text IN ('completed') THEN NOW() ELSE last_activity_at END,
           next_activity_at = CASE
-            WHEN ${due}::timestamptz IS NOT NULL AND ${status}::text IN ('upcoming','due','overdue') THEN ${due}::timestamptz
+            WHEN ${open}::bool AND ${due}::timestamptz IS NOT NULL THEN ${due}::timestamptz
+            WHEN ${closed}::bool THEN (
+              SELECT MIN(COALESCE(a.due_at, a.start_at))
+              FROM activities a
+              WHERE a.lead_id = ${lead}
+                AND a.status IN ('upcoming', 'due', 'overdue')
+            )
             ELSE next_activity_at
           END
         WHERE id=${lead}`.execute(this.db).catch(ignore);
@@ -379,7 +387,13 @@ export class ActivitiesRepository {
         UPDATE customers SET
           last_contacted_at = CASE WHEN ${status}::text = 'completed' THEN NOW() ELSE last_contacted_at END,
           next_follow_up_at = CASE
-            WHEN ${due}::timestamptz IS NOT NULL AND ${status}::text IN ('upcoming','due','overdue') THEN ${due}::timestamptz
+            WHEN ${open}::bool AND ${due}::timestamptz IS NOT NULL THEN ${due}::timestamptz
+            WHEN ${closed}::bool THEN (
+              SELECT MIN(COALESCE(a.due_at, a.start_at))
+              FROM activities a
+              WHERE a.customer_id = ${customer}
+                AND a.status IN ('upcoming', 'due', 'overdue')
+            )
             ELSE next_follow_up_at
           END
         WHERE id=${customer}`.execute(this.db).catch(ignore);
@@ -389,7 +403,13 @@ export class ActivitiesRepository {
         UPDATE deals SET
           last_activity_at = CASE WHEN ${status}::text = 'completed' THEN ${new Date()}::timestamptz ELSE last_activity_at END,
           next_activity_at = CASE
-            WHEN ${due}::timestamptz IS NOT NULL AND ${status}::text IN ('upcoming','due','overdue') THEN ${due}::timestamptz
+            WHEN ${open}::bool AND ${due}::timestamptz IS NOT NULL THEN ${due}::timestamptz
+            WHEN ${closed}::bool THEN (
+              SELECT MIN(COALESCE(a.due_at, a.start_at))
+              FROM activities a
+              WHERE a.deal_id = ${deal}
+                AND a.status IN ('upcoming', 'due', 'overdue')
+            )
             ELSE next_activity_at
           END
         WHERE id=${deal}`.execute(this.db).catch(ignore);
@@ -491,7 +511,7 @@ export class ActivitiesRepository {
     const r = await sql<{ tz: string | null }>`SELECT timezone AS tz FROM users WHERE id=${userId}`.execute(this.db);
     const row = r.rows[0];
     if (!row || row.tz === null) throw new Error("no timezone");
-    return row.tz === "" ? "UTC" : row.tz;
+    return row.tz === "" ? "Asia/Kathmandu" : row.tz;
   }
 
   async setUserTimezone(userId: string, tz: string): Promise<void> {
@@ -689,7 +709,7 @@ export class ActivitiesService {
   }
 
   async getTimezone(userId: string): Promise<string> {
-    return this.repo.userTimezone(userId).catch(() => "UTC");
+    return this.repo.userTimezone(userId).catch(() => "Asia/Kathmandu");
   }
 
   async setTimezone(userId: string, raw: string): Promise<void> {

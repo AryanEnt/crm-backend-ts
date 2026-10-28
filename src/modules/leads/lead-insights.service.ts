@@ -198,7 +198,7 @@ export class LeadInsightsService {
       const where = this.base(s, pipelineId);
       const fromTs: Frag = sql`${from.sql}::timestamptz`;
       const toTs: Frag = sql`${to.sql}::timestamptz`;
-      const wonIn = sql`l.status = 'won' AND l.won_at >= ${fromTs} AND l.won_at <= ${toTs}`;
+      const wonIn = sql`l.won_at IS NOT NULL AND l.won_at >= ${fromTs} AND l.won_at <= ${toTs}`;
       const lostIn = sql`l.status = 'lost' AND l.lost_at >= ${fromTs} AND l.lost_at <= ${toTs}`;
 
       const totals = await sql<CurrencyTotals>`
@@ -320,7 +320,7 @@ export class LeadInsightsService {
       const where = this.base(s, pipelineId);
       const fromTs: Frag = sql`${from.sql}::timestamptz`;
       const toTs: Frag = sql`${to.sql}::timestamptz`;
-      const wonIn = sql`l.status = 'won' AND l.won_at >= ${fromTs} AND l.won_at <= ${toTs}`;
+      const wonIn = sql`l.won_at IS NOT NULL AND l.won_at >= ${fromTs} AND l.won_at <= ${toTs}`;
       const lostIn = sql`l.status = 'lost' AND l.lost_at >= ${fromTs} AND l.lost_at <= ${toTs}`;
 
       const cur = await sql<{ currency: string; openCount: number; openValue: number }>`
@@ -400,7 +400,7 @@ export class LeadInsightsService {
           sql`COALESCE(l.last_activity_at, l.created_at) ASC`,
         ],
         recentlyWon: [
-          [...where, sql`l.status = 'won'`, sql`l.won_at >= NOW() - make_interval(days => ${RECENT_WON_DAYS})`],
+          [...where, sql`l.won_at IS NOT NULL`, sql`l.won_at >= NOW() - make_interval(days => ${RECENT_WON_DAYS})`],
           sql`l.won_at DESC`,
         ],
         recentlyCreated: [[...open, sql`l.created_at >= NOW() - make_interval(days => ${RECENT_CREATED_DAYS})`], sql`l.created_at DESC`],
@@ -470,11 +470,11 @@ export class LeadInsightsService {
       });
 
       const hist = await sql<{ won: number; closed: number }>`
-        SELECT COUNT(*) FILTER (WHERE l.status = 'won')::int AS "won", COUNT(*)::int AS "closed"
+        SELECT COUNT(*) FILTER (WHERE l.won_at IS NOT NULL)::int AS "won", COUNT(*)::int AS "closed"
         FROM leads l
         WHERE ${and([
           ...where,
-          sql`((l.status = 'won' AND l.won_at >= NOW() - make_interval(days => ${HISTORY_DAYS}))
+          sql`((l.won_at IS NOT NULL AND l.won_at >= NOW() - make_interval(days => ${HISTORY_DAYS}))
             OR (l.status = 'lost' AND l.lost_at >= NOW() - make_interval(days => ${HISTORY_DAYS})))`,
         ])}`.execute(this.db);
       const { won, closed } = hist.rows[0] ?? { won: 0, closed: 0 };

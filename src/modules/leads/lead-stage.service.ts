@@ -43,6 +43,8 @@ export interface MoveLeadInput {
   /** Required to move a Won or Lost lead anywhere else. */
   reopen?: boolean | undefined;
   lostReason?: string | undefined;
+  /** YYYY-MM-DD send deadline; required when marking Sales Won (creates a document request). */
+  documentDeadline?: string | undefined;
   nextActivity?: NextActivityInput | undefined;
 }
 
@@ -84,6 +86,8 @@ export interface BoardCard {
   wonAt: Date | null;
   lostAt: Date | null;
   lostReason: string;
+  /** Earliest open document send deadline for this lead (Nurturing chase). */
+  documentDeadlineAt: Date | null;
 }
 
 export interface BoardStage {
@@ -231,6 +235,17 @@ export function statusForStage(stage: Pick<Stage, "isWon" | "isLost">, lead: Pic
   return lead.isArchived ? lead.status : "open";
 }
 
+/** Fixed id of the post-win Nurturing pipeline (migration 000038). */
+export const NURTURING_PIPELINE_ID = "55555555-5555-5555-5555-555555555505";
+
+/** Parses a YYYY-MM-DD send deadline; returns null when missing or invalid. */
+export function parseDocumentDeadline(raw: string | undefined): Date | null {
+  const s = (raw ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T23:59:59.999Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 interface MovePlan {
   lead: MovableLead;
   toPipelineId: string;
@@ -239,6 +254,8 @@ interface MovePlan {
   lostReason: string;
   forced: boolean;
   reopened: boolean;
+  /** Keep won_at when handing a Won lead into Nurturing (status becomes open again). */
+  preserveWonAt?: boolean;
 }
 
 const MOVABLE_SELECT = sql`
@@ -356,6 +373,21 @@ export class LeadStageService {
         });
       }
     }
+
+    // Sales Won collects the document send deadline in the same step (Nurturing Complete is exempt).
+    if (toStage.isWon && toPipelineId !== NURTURING_PIPELINE_ID && lead.pipelineId !== NURTURING_PIPELINE_ID) {
+      if (!parseDocumentDeadline(in_.documentDeadline)) {
+        throw AppError.validation("Set a document send deadline before marking Won", {
+          reason: "document_deadline_required",
+          missingActivities: [],
+          missingDocuments: ["send_deadline"],
+          missingFields: [],
+          stageId: toStage.id,
+          stageName: toStage.name,
+        });
+      }
+    }
+
     const lostReason = (in_.lostReason ?? "").trim();
     if (toStage.isLost && lostReason === "") throw AppError.validation("lost reason is required");
 
@@ -394,7 +426,11 @@ export class LeadStageService {
           UPDATE leads SET
             pipeline_id = ${toPipelineId}, stage_id = ${toStage.id}, probability = ${toStage.probability},
             status = ${status}, stage_entered_at = ${now},
-            won_at = CASE WHEN ${toStage.isWon}::bool THEN ${now}::timestamptz ELSE NULL END,
+            won_at = CASE
+              WHEN ${plan.preserveWonAt === true}::bool THEN won_at
+              WHEN ${toStage.isWon}::bool THEN ${now}::timestamptz
+              ELSE NULL
+            END,
             lost_at = CASE WHEN ${toStage.isLost}::bool THEN ${now}::timestamptz ELSE NULL END,
             lost_reason = ${lostReason},
             last_activity_at = ${now}
@@ -455,8 +491,57 @@ export class LeadStageService {
   async move(actor: MoveActor, leadId: string, in_: MoveLeadInput, meta: RequestMeta): Promise<MoveOutcome> {
     const plan = await this.plan(actor, leadId, in_);
     const actorUserId = actor.kind === "user" ? actor.claims.userId : actor.actorUserId;
-    if (plan) await this.apply(actorUserId, plan, meta, actor.kind === "user" ? "crm" : "automation");
+    if (plan) {
+      const deadline = parseDocumentDeadline(in_.documentDeadline);
+      if (
+        deadline &&
+        plan.toStage.isWon &&
+        plan.toPipelineId !== NURTURING_PIPELINE_ID &&
+        plan.lead.pipelineId !== NURTURING_PIPELINE_ID
+      ) {
+        await this.createWonDocumentRequest(leadId, deadline);
+      }
+      await this.apply(actorUserId, plan, meta, actor.kind === "user" ? "crm" : "automation");
+      if (
+        plan.toStage.isWon &&
+        plan.toPipelineId !== NURTURING_PIPELINE_ID &&
+        plan.lead.pipelineId !== NURTURING_PIPELINE_ID
+      ) {
+        await this.handoffToNurturing(actorUserId, leadId, meta);
+      }
+    }
     return this.finish(actorUserId, leadId, plan !== null, in_, meta);
+  }
+
+  /**
+   * After Sales Won: reopen into Nurturing's first open stage, keeping won_at so targets
+   * still count the win while the board can chase documents.
+   */
+  private async handoffToNurturing(actorUserId: string | null, leadId: string, meta: RequestMeta): Promise<void> {
+    const nurture = await internal("failed to load nurturing pipeline", () => this.pipelines.get(NURTURING_PIPELINE_ID));
+    if (!nurture?.isActive) return;
+    const stage = nurture.stages.find((s) => s.isActive && !s.isWon && !s.isLost);
+    if (!stage) return;
+    const plan = await this.plan(
+      { kind: "automation", actorUserId },
+      leadId,
+      { stageId: stage.id, pipelineId: NURTURING_PIPELINE_ID, reopen: true, force: true },
+    );
+    if (!plan) return;
+    plan.preserveWonAt = true;
+    await this.apply(actorUserId, plan, meta, "automation");
+    // Drop stale next_activity_at left behind by completed meetings so Nurturing
+    // does not show an overdue "next action" that was already done.
+    await internal("failed to sync next activity after nurturing handoff", () =>
+      sql`
+        UPDATE leads SET next_activity_at = (
+          SELECT MIN(COALESCE(a.due_at, a.start_at))
+          FROM activities a
+          WHERE a.lead_id = ${leadId}
+            AND a.status IN ('upcoming', 'due', 'overdue')
+        )
+        WHERE id = ${leadId}`.execute(this.db),
+    ).catch(() => undefined);
   }
 
   /** Schedules the optional next activity and reports whether the lead still needs one. */
@@ -538,6 +623,21 @@ export class LeadStageService {
     return categories.filter((c) => !done.has(c));
   }
 
+  /** Creates the document request that carries the Won send deadline into Nurturing. */
+  private async createWonDocumentRequest(leadId: string, deadline: Date): Promise<void> {
+    await internal("failed to create document deadline", () =>
+      sql`
+        INSERT INTO documents (
+          id, name, category, doc_type, status, requested_at, expires_at, notes, lead_id
+        ) VALUES (
+          ${randomUUID()}, 'Documents due', 'other', 'other', 'requested',
+          ${new Date()}, ${deadline},
+          'Send-by date set when the lead was marked Won. Chase these in Nurturing.',
+          ${leadId}
+        )`.execute(this.db),
+    );
+  }
+
   // ---------------------------------------------------------------- board
 
   private boardWhere(f: Omit<BoardFilter, "limit">): Predicate[] {
@@ -571,6 +671,7 @@ export class LeadStageService {
           CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
           COALESCE(l.stage_entered_at, l.created_at) AS "stageEnteredAt",
           l.won_at AS "wonAt", l.lost_at AS "lostAt", l.lost_reason AS "lostReason",
+          dd.deadline AS "documentDeadlineAt",
           ROW_NUMBER() OVER (
             PARTITION BY l.stage_id ORDER BY COALESCE(l.stage_entered_at, l.created_at) DESC, l.id
           ) AS rn
@@ -584,6 +685,13 @@ export class LeadStageService {
           ORDER BY a.due_at ASC NULLS LAST
           LIMIT 1
         ) na ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT MIN(d.expires_at) AS deadline
+          FROM documents d
+          WHERE d.lead_id = l.id
+            AND d.expires_at IS NOT NULL
+            AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
+        ) dd ON TRUE
         WHERE ${and(where)}
       ) ranked
       WHERE rn > ${offset} AND rn <= ${offset + perStage}

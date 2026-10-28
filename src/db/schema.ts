@@ -833,6 +833,34 @@ export interface WhatsappMessages {
   updated_at: Generated<Timestamp>;
 }
 
+export interface WhatsappCalls {
+  account_id: string;
+  activity_id: string | null;
+  actor_user_id: string | null;
+  created_at: Generated<Timestamp>;
+  customer_id: string | null;
+  deal_id: string | null;
+  direction: string;
+  duration_seconds: number | null;
+  ended_at: Timestamp | null;
+  error_code: Generated<string>;
+  error_message: Generated<string>;
+  from_number: Generated<string>;
+  id: Generated<string>;
+  lead_id: string | null;
+  local_sdp: Generated<string>;
+  local_sdp_type: Generated<string>;
+  provider_call_id: Generated<string>;
+  raw_payload: Generated<Json>;
+  remote_sdp: Generated<string>;
+  remote_sdp_type: Generated<string>;
+  started_at: Timestamp | null;
+  status: Generated<string>;
+  timeline_event_id: string | null;
+  to_number: Generated<string>;
+  updated_at: Generated<Timestamp>;
+}
+
 export interface DB {
   activities: Activities;
   activity_types: ActivityTypes;
@@ -883,5 +911,6 @@ export interface DB {
   twilio_calls: TwilioCalls;
   users: Users;
   webhook_receipts: WebhookReceipts;
+  whatsapp_calls: WhatsappCalls;
   whatsapp_messages: WhatsappMessages;
 }

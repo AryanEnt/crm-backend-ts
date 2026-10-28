@@ -71,12 +71,64 @@ export interface CallStatusEvent {
   raw: Json;
 }
 
+export type WhatsAppCallAction = "connect" | "pre_accept" | "accept" | "reject" | "terminate";
+
+export interface WhatsAppCallActionRequest {
+  phoneNumberId: string;
+  accessToken: string;
+  graphApiVersion: string;
+  action: WhatsAppCallAction;
+  /** Required for pre_accept / accept / reject / terminate. */
+  callId: string;
+  /** Required for connect (business-initiated). */
+  to: string;
+  sdp: string;
+  sdpType: string;
+  bizOpaqueCallbackData: string;
+}
+
+export interface WhatsAppCallActionResult {
+  callId: string;
+  success: boolean;
+  raw: Json | null;
+}
+
+export interface CallPermissionRequest {
+  phoneNumberId: string;
+  accessToken: string;
+  graphApiVersion: string;
+  to: string;
+  body: string;
+}
+
+/** Parsed Meta `calls` webhook field (connect / terminate). */
+export interface InboundWhatsAppCallEvent {
+  phoneNumberId: string;
+  callId: string;
+  event: string;
+  direction: string;
+  from: string;
+  to: string;
+  status: string;
+  duration: number | null;
+  startTime: Date | null;
+  endTime: Date | null;
+  sdpType: string;
+  sdp: string;
+  timestamp: Date;
+  eventKey: string;
+  raw: Json | null;
+}
+
 /** Meta WhatsApp Cloud API, isolated from the rest of the CRM. WhatsApp never goes through Twilio. */
 export interface WhatsAppProvider {
   send(req: OutboundMessageRequest): Promise<OutboundMessageResult>;
+  sendCallPermission(req: CallPermissionRequest): Promise<OutboundMessageResult>;
+  callAction(req: WhatsAppCallActionRequest): Promise<WhatsAppCallActionResult>;
   verifyWebhook(mode: string, token: string, challenge: string, verifyToken: string): string | null;
   validateSignature(appSecret: string, body: Buffer, signatureHeader: string): boolean;
   parseWebhook(body: Buffer): InboundWhatsAppEvent[];
+  parseCallWebhook(body: Buffer): InboundWhatsAppCallEvent[];
 }
 
 /** Twilio Voice, isolated from the rest of the CRM. */
@@ -124,6 +176,62 @@ export class MetaWhatsAppProvider implements WhatsAppProvider {
     const first = asObject(asArray(raw?.messages)?.[0]);
     const msgId = str(first?.id);
     return { providerMessageId: msgId || `wamid.${randomUUID()}`, raw };
+  }
+
+  async sendCallPermission(req: CallPermissionRequest): Promise<OutboundMessageResult> {
+    if (req.accessToken.trim() === "" || req.phoneNumberId.trim() === "") {
+      throw new Error("meta whatsapp credentials incomplete");
+    }
+    const ver = req.graphApiVersion || "v21.0";
+    const bodyText = req.body.trim() || "We would like to call you on WhatsApp.";
+    const payload: Json = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: normalizePhone(req.to),
+      type: "interactive",
+      interactive: {
+        type: "call_permission_request",
+        action: { name: "call_permission_request" },
+        body: { text: bodyText },
+      },
+    };
+    const res = await fetch(`https://graph.facebook.com/${ver}/${req.phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${req.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    const raw = jsonObject(text);
+    if (res.status >= 300) throw new Error(`meta call permission failed (${res.status}): ${truncateBytes(text, 400)}`);
+    const first = asObject(asArray(raw?.messages)?.[0]);
+    return { providerMessageId: str(first?.id) || `wamid.${randomUUID()}`, raw };
+  }
+
+  async callAction(req: WhatsAppCallActionRequest): Promise<WhatsAppCallActionResult> {
+    if (req.accessToken.trim() === "" || req.phoneNumberId.trim() === "") {
+      throw new Error("meta whatsapp credentials incomplete");
+    }
+    const ver = req.graphApiVersion || "v21.0";
+    const payload: Json = { messaging_product: "whatsapp", action: req.action };
+    if (req.callId.trim() !== "") payload.call_id = req.callId;
+    if (req.to.trim() !== "") payload.to = normalizePhone(req.to);
+    if (req.sdp.trim() !== "") {
+      payload.session = { sdp_type: req.sdpType || "offer", sdp: req.sdp };
+    }
+    if (req.bizOpaqueCallbackData.trim() !== "") payload.biz_opaque_callback_data = req.bizOpaqueCallbackData;
+    const res = await fetch(`https://graph.facebook.com/${ver}/${req.phoneNumberId}/calls`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${req.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    const raw = jsonObject(text);
+    if (res.status >= 300) throw new Error(`meta whatsapp call ${req.action} failed (${res.status}): ${truncateBytes(text, 400)}`);
+    const first = asObject(asArray(raw?.calls)?.[0]);
+    const callId = str(first?.id) || req.callId || `wacid.${randomUUID()}`;
+    return { callId, success: raw?.success === true || callId !== "", raw };
   }
 
   verifyWebhook(mode: string, token: string, challenge: string, verifyToken: string): string | null {
@@ -189,6 +297,51 @@ export class MetaWhatsAppProvider implements WhatsAppProvider {
     }
     return out;
   }
+
+  parseCallWebhook(body: Buffer): InboundWhatsAppCallEvent[] {
+    const root: unknown = JSON.parse(body.toString());
+    if (root !== null && (typeof root !== "object" || Array.isArray(root))) throw new Error("invalid webhook payload");
+    const out: InboundWhatsAppCallEvent[] = [];
+    for (const e of asArray(asObject(root)?.entry) ?? []) {
+      for (const ch of asArray(asObject(e)?.changes) ?? []) {
+        const change = asObject(ch);
+        if (str(change?.field) !== "" && str(change?.field) !== "calls") continue;
+        const value = asObject(change?.value);
+        if (!value || !asArray(value.calls)) continue;
+        const meta = asObject(value.metadata);
+        const phoneNumberId = str(meta?.phone_number_id);
+        for (const call of asArray(value.calls) ?? []) {
+          const c = asObject(call);
+          if (!c) continue;
+          const id = str(c.id);
+          const event = str(c.event);
+          const session = asObject(c.session) ?? asObject(asObject(c.connection)?.webrtc);
+          const statusRaw = c.status;
+          let status = "";
+          if (typeof statusRaw === "string") status = statusRaw;
+          else if (Array.isArray(statusRaw) && statusRaw.length > 0) status = str(statusRaw[0]);
+          out.push({
+            phoneNumberId,
+            callId: id,
+            event,
+            direction: str(c.direction),
+            from: str(c.from),
+            to: str(c.to),
+            status,
+            duration: typeof c.duration === "number" ? c.duration : goAtoi(asString(c.duration)),
+            startTime: str(asString(c.start_time)) !== "" ? parseUnix(asString(c.start_time)) : null,
+            endTime: str(asString(c.end_time)) !== "" ? parseUnix(asString(c.end_time)) : null,
+            sdpType: str(session?.sdp_type) || (str(session?.sdp) !== "" ? "answer" : ""),
+            sdp: str(session?.sdp),
+            timestamp: parseUnix(asString(c.timestamp)),
+            eventKey: `wa-call:${id}:${event || status || "event"}`,
+            raw: c,
+          });
+        }
+      }
+    }
+    return out;
+  }
 }
 
 const blankEvent = (): Omit<InboundWhatsAppEvent, "kind" | "timestamp" | "eventKey" | "raw"> => ({
@@ -203,6 +356,21 @@ export class DevWhatsAppProvider implements WhatsAppProvider {
     return Promise.resolve({ providerMessageId: `wamid.dev.${randomUUID()}`, raw: { simulated: true, to: req.to } });
   }
 
+  sendCallPermission(req: CallPermissionRequest): Promise<OutboundMessageResult> {
+    return Promise.resolve({
+      providerMessageId: `wamid.dev.perm.${randomUUID()}`,
+      raw: { simulated: true, to: req.to, type: "call_permission_request" },
+    });
+  }
+
+  callAction(req: WhatsAppCallActionRequest): Promise<WhatsAppCallActionResult> {
+    return Promise.resolve({
+      callId: req.callId || `wacid.dev.${randomUUID()}`,
+      success: true,
+      raw: { simulated: true, action: req.action, to: req.to },
+    });
+  }
+
   verifyWebhook(mode: string, token: string, challenge: string, verifyToken: string): string | null {
     return this.meta.verifyWebhook(mode, token, challenge, verifyToken);
   }
@@ -214,6 +382,10 @@ export class DevWhatsAppProvider implements WhatsAppProvider {
 
   parseWebhook(body: Buffer): InboundWhatsAppEvent[] {
     return this.meta.parseWebhook(body);
+  }
+
+  parseCallWebhook(body: Buffer): InboundWhatsAppCallEvent[] {
+    return this.meta.parseCallWebhook(body);
   }
 }
 

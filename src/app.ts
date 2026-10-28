@@ -135,7 +135,19 @@ export function createApp({ config, db, store = createStore(config.storageDriver
   app.use(forecastingRouter(new ForecastingService(db), guard));
   app.use(predictionsRouter(new PredictionsService(db), db, guard));
   app.use(automationRouter(new AutomationService(new AutomationRepository(db), audit, automationWake), guard));
-  app.use(communicationsRouter(new CommunicationsService(db, timeline, audit, config.publicApiUrl), guard));
+  app.use(
+    communicationsRouter(
+      new CommunicationsService(db, timeline, audit, config.publicApiUrl, {
+        appId: config.metaAppId,
+        appSecret: config.metaAppSecret,
+        configId: config.metaWhatsAppConfigId,
+        verifyToken: config.metaWhatsAppVerifyToken,
+        graphApiVersion: config.metaGraphApiVersion,
+        publicApiUrl: config.publicApiUrl,
+      }),
+      guard,
+    ),
+  );
   app.use(emailRouter(new EmailService(db, config, audit, timeline), guard));
 
   // Everything not ported yet is served by the Go backend.

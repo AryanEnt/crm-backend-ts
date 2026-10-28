@@ -155,22 +155,33 @@ describe("lead stage helpers", () => {
 });
 
 describe("LeadStageService.move", () => {
+  it("blocks Won until a document send deadline is provided", async () => {
+    const { f, svc } = service();
+    f.queue([lead()]);
+    const err = await rejection(svc.move(user, "lead-1", { stageId: WON.id }, META));
+    expect(err.message).toBe("Set a document send deadline before marking Won");
+    expect(err.details).toMatchObject({ reason: "document_deadline_required", missingDocuments: ["send_deadline"] });
+    expect(f.queries).toHaveLength(1);
+  });
+
   it("moves to Won in one transaction: lead, transition, timeline, audit, automation event", async () => {
     const { f, svc, wake } = service();
-    f.queue([lead()], [], [], [], [{ id: "t1", metadata: {} }], [], [], [{ status: "won", nextActivityAt: null }]);
+    // Doc request + Won write; Nurturing handoff no-ops when the pipeline stub has no Nurturing id.
+    f.queue([lead()], [], [], [], [], [{ id: "t1", metadata: {} }], [], [], [{ status: "won", nextActivityAt: null }]);
 
-    const out = await svc.move(user, "lead-1", { stageId: WON.id }, META);
+    const out = await svc.move(user, "lead-1", { stageId: WON.id, documentDeadline: "2030-06-15" }, META);
 
     expect(out).toEqual({ leadId: "lead-1", changed: true, status: "won", needsNextActivity: false });
     const q = sqlOf(f);
-    expect(q[1]).toMatch(/^UPDATE leads SET pipeline_id = \$1, stage_id = \$2, probability = \$3, status = \$4/);
-    expect(f.queries[1]!.parameters.slice(0, 4)).toEqual([PIPE, WON.id, 100, "won"]);
-    expect(q[2]).toMatch(/^INSERT INTO lead_stage_transitions/);
-    expect(f.queries[2]!.parameters.slice(1, 6)).toEqual(["lead-1", PIPE, CREATED.id, PIPE, WON.id]);
-    expect(q[3]).toMatch(/^INSERT INTO timeline_events/);
-    expect(q[5]).toMatch(/^insert into "audit_logs"/);
-    expect(q[6]).toMatch(/^insert into "automation_events"/);
-    expect(f.queries[6]!.parameters).toContain("lead.stage_changed");
+    expect(q[1]).toMatch(/^INSERT INTO documents/);
+    expect(q[2]).toMatch(/^UPDATE leads SET pipeline_id = \$1, stage_id = \$2, probability = \$3, status = \$4/);
+    expect(f.queries[2]!.parameters.slice(0, 4)).toEqual([PIPE, WON.id, 100, "won"]);
+    expect(q[3]).toMatch(/^INSERT INTO lead_stage_transitions/);
+    expect(f.queries[3]!.parameters.slice(1, 6)).toEqual(["lead-1", PIPE, CREATED.id, PIPE, WON.id]);
+    expect(q[4]).toMatch(/^INSERT INTO timeline_events/);
+    expect(q[6]).toMatch(/^insert into "audit_logs"/);
+    expect(q[7]).toMatch(/^insert into "automation_events"/);
+    expect(f.queries[7]!.parameters).toContain("lead.stage_changed");
     expect(wake).toHaveBeenCalledOnce();
   });
 

@@ -266,6 +266,49 @@ describe("communication providers", () => {
     expect(meta.validateSignature("", body, `sha256=${sig}`)).toBe(false);
   });
 
+  it("parses Meta calls webhooks for connect offers", () => {
+    const meta = new MetaWhatsAppProvider();
+    const body = Buffer.from(
+      JSON.stringify({
+        object: "whatsapp_business_account",
+        entry: [
+          {
+            changes: [
+              {
+                field: "calls",
+                value: {
+                  messaging_product: "whatsapp",
+                  metadata: { phone_number_id: "436666719526789", display_phone_number: "13175551399" },
+                  calls: [
+                    {
+                      id: "wacid.ABC",
+                      to: "16315553601",
+                      from: "13175551399",
+                      event: "connect",
+                      timestamp: "1671644824",
+                      direction: "USER_INITIATED",
+                      session: { sdp_type: "offer", sdp: "v=0" },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const events = meta.parseCallWebhook(body);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      callId: "wacid.ABC",
+      event: "connect",
+      phoneNumberId: "436666719526789",
+      sdpType: "offer",
+      sdp: "v=0",
+      direction: "USER_INITIATED",
+    });
+  });
+
   it("validates Twilio's X-Twilio-Signature over the URL and sorted params", () => {
     const twilio = new TwilioVoiceProvider();
     const url = "https://api.example.com/api/v1/webhooks/twilio/voice/status?x=1";

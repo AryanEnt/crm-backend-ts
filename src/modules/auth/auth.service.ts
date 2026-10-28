@@ -46,7 +46,8 @@ export function isValidTimezone(tz: string): boolean {
   return resolved.toLowerCase() !== tz.toLowerCase() || resolved === tz;
 }
 
-const coalesceTz = (tz: string) => (tz.trim() === "" ? "UTC" : tz);
+const DEFAULT_TIMEZONE = "Asia/Kathmandu";
+const coalesceTz = (tz: string) => (tz.trim() === "" ? DEFAULT_TIMEZONE : tz);
 
 export class AuthService {
   constructor(

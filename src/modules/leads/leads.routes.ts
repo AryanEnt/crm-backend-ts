@@ -105,6 +105,7 @@ const moveSchema = z.strictObject({
   force: bool(),
   reopen: bool(),
   lostReason: str(),
+  documentDeadline: optionalString(),
   nextActivity: optionalObject(nextActivitySchema),
 });
 

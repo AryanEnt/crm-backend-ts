@@ -21,6 +21,8 @@ export const Metric = {
   Conversions: "conversions",
   PipelineValue: "pipeline_value",
   Activities: "activities",
+  ActivitiesCalls: "activities_calls",
+  ActivitiesMeetings: "activities_meetings",
   WonRevenue: "won_revenue",
   LeadsWon: "leads_won",
   WonLeadValue: "won_lead_value",
@@ -37,7 +39,9 @@ export const METRICS_CATALOG = [
   { code: Metric.WonLeadValue, label: "Won value" },
   { code: Metric.ProposalEntries, label: "Leads reaching Proposal" },
   { code: Metric.OpenLeadValue, label: "Open lead value" },
-  { code: Metric.Activities, label: "Activities" },
+  { code: Metric.Activities, label: "Activities (any)" },
+  { code: Metric.ActivitiesCalls, label: "Calls" },
+  { code: Metric.ActivitiesMeetings, label: "Meetings" },
   { code: Metric.QualifiedLeads, label: "Qualified leads", legacy: true },
   { code: Metric.Submissions, label: "Submissions (deals)", legacy: true },
   { code: Metric.PositiveOutcomes, label: "Deals won", legacy: true },
@@ -252,8 +256,8 @@ export function validateInput(
   value: number,
 ): void {
   if (!VALID_METRICS.includes(metric)) throw AppError.validation("invalid metric");
-  if (periodType !== "monthly" && periodType !== "quarterly") {
-    throw AppError.validation("periodType must be monthly or quarterly");
+  if (periodType !== "daily" && periodType !== "monthly" && periodType !== "quarterly") {
+    throw AppError.validation("periodType must be daily, monthly or quarterly");
   }
   if (scopeType !== ScopeType.Organization && scopeType !== ScopeType.Team && scopeType !== ScopeType.User) {
     throw AppError.validation("invalid scopeType");
@@ -279,10 +283,19 @@ const NS_MS = 1e-6;
 
 const DEAL_METRICS = new Set<string>([Metric.Submissions, Metric.PositiveOutcomes, Metric.WonRevenue, Metric.PipelineValue]);
 
+const ACTIVITY_METRICS = new Set<string>([Metric.Activities, Metric.ActivitiesCalls, Metric.ActivitiesMeetings]);
+
 /** Pipeline kind a metric counts in: deal metrics read sales pipelines, activities either, the rest leads. */
 export function pipelineKindFor(metric: string): "sales" | "leads" | null {
-  if (metric === Metric.Activities) return null;
+  if (ACTIVITY_METRICS.has(metric)) return null;
   return DEAL_METRICS.has(metric) ? "sales" : "leads";
+}
+
+/** Activity kind (activities.kind) for a typed activity metric, or "" for any activity. */
+export function activityKindFor(metric: string): string {
+  if (metric === Metric.ActivitiesCalls) return "call";
+  if (metric === Metric.ActivitiesMeetings) return "meeting";
+  return "";
 }
 
 export class TargetsRepository {
@@ -439,11 +452,16 @@ export class TargetsRepository {
         const measure = t.metric === Metric.WonLeadValue ? sql`COALESCE(SUM(l.potential_value),0)` : sql`COUNT(*)`;
         q = sql`
           SELECT ${measure}::float8 AS v FROM leads l
-          WHERE l.is_archived=FALSE AND l.status='won' AND l.won_at IS NOT NULL
+          WHERE l.is_archived=FALSE AND l.won_at IS NOT NULL
             AND l.won_at::date >= ${from}::date AND l.won_at::date <= ${to}::date
             AND ${leadInTeam(team)}
             AND (${user}='' OR l.owner_user_id::text=${user})
-            AND (${pipe}='' OR l.pipeline_id::text=${pipe})`;
+            AND (${pipe}='' OR l.pipeline_id::text=${pipe}
+              OR EXISTS (
+                SELECT 1 FROM lead_stage_transitions t
+                JOIN pipeline_stages ps ON ps.id = t.to_stage_id AND ps.is_won
+                WHERE t.lead_id = l.id AND t.to_pipeline_id::text = ${pipe}
+              ))`;
         break;
       }
       case Metric.ProposalEntries:
@@ -469,9 +487,13 @@ export class TargetsRepository {
             AND (${pipe}='' OR l.pipeline_id::text=${pipe})`;
         break;
       case Metric.Activities:
+      case Metric.ActivitiesCalls:
+      case Metric.ActivitiesMeetings: {
+        const kind = activityKindFor(t.metric);
         q = sql`
           SELECT COUNT(*)::float8 AS v FROM activities a
           WHERE a.created_at::date >= ${from}::date AND a.created_at::date <= ${to}::date
+            AND (${kind}='' OR a.kind = ${kind})
             AND (${team}='' OR EXISTS (
                 SELECT 1 FROM deals d WHERE d.id=a.deal_id AND d.team_id::text=${team}
               ) OR EXISTS (
@@ -486,6 +508,7 @@ export class TargetsRepository {
                 SELECT 1 FROM leads l WHERE l.id=a.lead_id AND l.pipeline_id::text=${pipe}
               ))`;
         break;
+      }
       default:
         return 0;
     }

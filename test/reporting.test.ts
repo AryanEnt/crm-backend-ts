@@ -141,8 +141,9 @@ describe("target policy", () => {
       return errorOf(() => validateInput(a.metric as string, a.periodType as string, a.scopeType as string, a.start as string, a.end as string, a.team as string | null, a.user as string | null, a.value as number));
     };
     expect(v()).toBeNull();
+    expect(v({ periodType: "daily", start: "2026-10-28", end: "2026-10-28" })).toBeNull();
     expect(v({ metric: "calls", periodType: "weekly" })).toMatchObject({ message: "invalid metric" });
-    expect(v({ periodType: "weekly" })).toMatchObject({ message: "periodType must be monthly or quarterly" });
+    expect(v({ periodType: "weekly" })).toMatchObject({ message: "periodType must be daily, monthly or quarterly" });
     expect(v({ scopeType: "region" })).toMatchObject({ message: "invalid scopeType" });
     expect(v({ start: "09/01/2026" })).toMatchObject({ message: "invalid periodStart" });
     expect(v({ end: "2026-02-30" })).toMatchObject({ message: "invalid periodEnd" });

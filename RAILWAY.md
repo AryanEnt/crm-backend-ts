@@ -36,14 +36,17 @@ Reference the existing Postgres and Go services instead of copying values.
 | `PUBLIC_API_URL`           | This service's public URL, e.g. `https://${{RAILWAY_PUBLIC_DOMAIN}}` |
 | `GO_BACKEND_URL`           | Switch-over only: `http://${{<go-service>.RAILWAY_PRIVATE_DOMAIN}}:${{<go-service>.PORT}}` |
 | `STORAGE_ROOT`             | `/data/storage` when this service has a volume mounted at `/data`; otherwise `/app/storage` |
+| `RAILWAY_RUN_UID`          | `0` when using a Railway volume with this image                     |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GMAIL_PUBSUB_TOPIC` | Same as Go, when used |
 
 `PORT` is injected by Railway; do not set it.
 
 Do not point `STORAGE_ROOT` at a sibling service's directory (for example
 `../backend/storage`). Each Railway service has its own filesystem. For persistent
-uploads, mount a volume on the TS service at `/data` and set `STORAGE_ROOT=/data/storage`;
-without a volume, use `/app/storage` (writable by the container's `node` user, but
+uploads, mount a volume on the TS service at `/data` and set `STORAGE_ROOT=/data/storage`.
+Railway mounts volumes as `root`, while this image runs as `node`; set
+`RAILWAY_RUN_UID=0` on the TS service so it can create and write `/data/storage`.
+Without a volume, use `/app/storage` (writable by the container's `node` user, but
 ephemeral across redeploys).
 
 `JWT_SECRET` must match so sessions carry over, and `TOKEN_ENCRYPTION_KEY` (or
