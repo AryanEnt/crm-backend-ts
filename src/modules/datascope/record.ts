@@ -29,8 +29,9 @@ export interface RecordSpec {
 
 /**
  * Document visibility:
- * - Own-scope (SE): only docs shared via document_viewers, or ones they uploaded.
- * - Team-scope (TL): parent lead/customer/deal in team, or uploader, or viewer ACL.
+ * - Linked to a lead/customer/deal the caller can already see (so lead Files works), or
+ * - Uploaded by the caller, or
+ * - Explicitly shared via document_viewers (library / unlinked files).
  */
 function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predicate[] {
   const shared = sql`EXISTS (
@@ -38,11 +39,6 @@ function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predi
     WHERE dv.document_id = d.id AND dv.user_id = ${claims.userId}::uuid
   )`;
   const uploaded = sql`d.uploaded_by = ${claims.userId}::uuid`;
-
-  const ownOnly = !v.unscoped && v.teamIds.length === 0 && v.ownerIds.length > 0;
-  if (ownOnly) {
-    return [...where, sql`(${uploaded} OR ${shared})`];
-  }
 
   const parents = [
     { column: "d.lead_id", from: "leads pl", alias: "pl" },

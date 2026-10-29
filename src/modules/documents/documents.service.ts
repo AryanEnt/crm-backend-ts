@@ -66,6 +66,8 @@ export interface DocumentListFilter {
   status: string;
   type: string;
   q: string;
+  /** When true, hide lead screenshots from the Documents library list. */
+  excludeScreenshots: boolean;
   limit: number;
   offset: number;
   scope: Visibility;
@@ -181,6 +183,9 @@ export class DocumentsRepository {
     if (f.leadId !== "") where.push(sql`d.lead_id::text = ${f.leadId}`);
     if (f.status !== "") where.push(sql`d.status = ${f.status}`);
     if (f.type !== "") where.push(sql`d.doc_type = ${f.type}`);
+    if (f.excludeScreenshots) {
+      where.push(sql`lower(d.doc_type) <> 'screenshot' AND lower(d.category) <> 'screenshot'`);
+    }
     if (f.q !== "") {
       const like = `%${f.q.toLowerCase()}%`;
       where.push(sql`(lower(d.name) LIKE ${like} OR lower(d.doc_type) LIKE ${like})`);
@@ -337,6 +342,23 @@ export class DocumentsRepository {
     return unique;
   }
 
+  /** Always include the lead's SE owner so Files on that lead stay visible to them. */
+  async withLeadOwnerViewer(viewers: string[], leadId: string | undefined): Promise<string[]> {
+    const id = blankToNull(leadId);
+    if (!id) return viewers;
+    const r = await sql<{ ownerId: string }>`
+      SELECT l.owner_user_id::text AS "ownerId"
+      FROM leads l
+      JOIN users u ON u.id = l.owner_user_id
+      JOIN roles r ON r.id = u.role_id
+      WHERE l.id = ${id}
+        AND u.is_active = TRUE
+        AND r.code = ${Role.SalesExecutive}`.execute(this.db);
+    const ownerId = r.rows[0]?.ownerId;
+    if (!ownerId || viewers.includes(ownerId)) return viewers;
+    return [...viewers, ownerId];
+  }
+
   async refreshExpired(): Promise<void> {
     await sql`
       UPDATE documents SET status = 'expired'
@@ -391,7 +413,10 @@ export class DocumentsService {
 
   async request(claims: Claims, in_: RequestDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
     if (in_.name.trim() === "") throw AppError.validation("name is required");
-    const viewers = await this.repo.resolveViewerIds(claims, in_.viewerUserIds);
+    const viewers = await this.repo.withLeadOwnerViewer(
+      await this.repo.resolveViewerIds(claims, in_.viewerUserIds),
+      in_.leadId,
+    );
     const status = in_.status === DocumentStatus.Missing ? DocumentStatus.Missing : DocumentStatus.Requested;
     const expires = parseExpiry(in_.expiryDate);
     const d = await internal("failed to request document", async () => {
@@ -408,7 +433,10 @@ export class DocumentsService {
   async uploadNew(claims: Claims, in_: NewUpload, file: FileUpload, meta: RequestMeta): Promise<DocumentRecord> {
     const input = { ...in_, name: in_.name.trim() === "" ? file.filename : in_.name };
     if (input.name.trim() === "") throw AppError.validation("name is required");
-    const viewers = await this.repo.resolveViewerIds(claims, in_.viewerUserIds);
+    const viewers = await this.repo.withLeadOwnerViewer(
+      await this.repo.resolveViewerIds(claims, in_.viewerUserIds),
+      input.leadId,
+    );
     const expires = parseExpiry(input.expiryDate);
     const dest = this.destination(input.type, input.category, input.customerId, input.dealId, input.leadId);
     const stored = await this.put(dest.store, dest.prefix, file);

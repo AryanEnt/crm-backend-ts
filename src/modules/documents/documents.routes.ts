@@ -14,7 +14,7 @@ import { inScope, type Guard } from "../auth/guard.js";
 import type { Claims } from "../auth/types.js";
 import { resolve } from "../datascope/datascope.js";
 import { Records, requireRecord } from "../datascope/record.js";
-import { P } from "../permissions/permissions.js";
+import { expandImplies, P, Role } from "../permissions/permissions.js";
 import { goPathBase, type DocumentsService } from "./documents.service.js";
 import { inlineContentType } from "./preview.js";
 
@@ -62,8 +62,21 @@ function parseViewerUserIds(form: MultipartForm): string[] | undefined {
 
 const rejectSchema = z.strictObject({ reason: str() });
 
+function isScreenshotType(type: string, category: string): boolean {
+  return type.trim().toLowerCase() === "screenshot" || category.trim().toLowerCase() === "screenshot";
+}
+
+function hasPerm(claims: Claims, ...codes: string[]): boolean {
+  return expandImplies(claims.permissions).hasAny(...codes);
+}
+
 /** 404s when a document would be attached to a lead, customer or deal the caller can't see. */
-async function requireParents(db: Database, claims: Claims, ids: { leadId?: string; customerId?: string; dealId?: string }) {
+async function requireParents(
+  db: Database,
+  claims: Claims,
+  ids: { leadId?: string; customerId?: string; dealId?: string },
+  ...perms: string[]
+) {
   const parents = [
     [ids.leadId, Records.Leads],
     [ids.customerId, Records.Customers],
@@ -71,8 +84,32 @@ async function requireParents(db: Database, claims: Claims, ids: { leadId?: stri
   ] as const;
   for (const [id, rec] of parents) {
     if (id === undefined || id.trim() === "") continue;
-    await requireRecord(db, claims, rec, id.trim(), P.DocumentsCreate);
+    await requireRecord(db, claims, rec, id.trim(), ...perms);
   }
+}
+
+/** SE may upload screenshots onto leads they can edit; TL/admin use documents:create. */
+async function assertCanUploadNew(
+  db: Database,
+  claims: Claims,
+  input: { type: string; category: string; leadId?: string; customerId?: string; dealId?: string },
+) {
+  if (hasPerm(claims, P.DocumentsCreate)) {
+    await requireParents(db, claims, input, P.DocumentsCreate);
+    return;
+  }
+  const leadId = input.leadId?.trim() ?? "";
+  if (
+    claims.roleCode === Role.SalesExecutive &&
+    isScreenshotType(input.type, input.category) &&
+    leadId !== "" &&
+    !input.customerId &&
+    !input.dealId
+  ) {
+    await requireRecord(db, claims, Records.Leads, leadId, P.LeadsEdit, P.LeadsView);
+    return;
+  }
+  throw AppError.forbidden("insufficient permissions");
 }
 
 const orUndefined = (v: string): string | undefined => (v === "" ? undefined : v);
@@ -102,6 +139,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       status: q("status"),
       type: q("type"),
       q: q("q"),
+      excludeScreenshots: q("excludeScreenshots") === "1" || q("excludeScreenshots") === "true",
       limit,
       offset,
     });
@@ -144,6 +182,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
 
     const docId = form.value("documentId").trim() || pathParam(req, "id");
     if (docId !== "") {
+      if (!hasPerm(claims, P.DocumentsCreate)) throw AppError.forbidden("insufficient permissions");
       await requireRecord(db, claims, Records.Documents, docId, P.DocumentsCreate);
       ok(res, await service.uploadToExisting(claims.userId, docId, upload, meta));
       return;
@@ -160,11 +199,12 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       notes: form.value("notes"),
       viewerUserIds: parseViewerUserIds(form),
     };
-    await requireParents(db, claims, input);
+    await assertCanUploadNew(db, claims, input);
     created(res, await service.uploadNew(claims, input, upload, meta));
   };
 
-  router.post("/api/v1/documents/upload", ...guard(...create), upload);
+  // Auth only — create vs SE lead-screenshot is decided in handleUpload.
+  router.post("/api/v1/documents/upload", ...guard(), upload);
 
   router.get("/api/v1/documents/:id", ...guard(...view), inScope(db, Records.Documents, view), async (req, res) => {
     ok(res, await service.get(pathParam(req, "id")));
@@ -175,8 +215,23 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     ok(res, await service.update(claimsOf(req), pathParam(req, "id"), input, requestMetaFirstHop(req)));
   });
 
-  router.delete("/api/v1/documents/:id", ...guard(...del), inScope(db, Records.Documents, del), async (req, res) => {
-    await service.delete(claimsOf(req).userId, pathParam(req, "id"), requestMetaFirstHop(req));
+  router.delete("/api/v1/documents/:id", ...guard(), async (req, res) => {
+    const claims = claimsOf(req);
+    const id = pathParam(req, "id");
+    if (hasPerm(claims, P.DocumentsDelete)) {
+      await requireRecord(db, claims, Records.Documents, id, P.DocumentsDelete);
+    } else if (claims.roleCode === Role.SalesExecutive) {
+      // SE may remove screenshots on leads they can see.
+      await requireRecord(db, claims, Records.Documents, id, P.DocumentsView);
+      const doc = await service.get(id);
+      if (!isScreenshotType(doc.type, doc.category) || !doc.leadId) {
+        throw AppError.forbidden("insufficient permissions");
+      }
+      await requireRecord(db, claims, Records.Leads, doc.leadId, P.LeadsEdit, P.LeadsView);
+    } else {
+      throw AppError.forbidden("insufficient permissions");
+    }
+    await service.delete(claims.userId, id, requestMetaFirstHop(req));
     ok(res, { deleted: true });
   });
 
