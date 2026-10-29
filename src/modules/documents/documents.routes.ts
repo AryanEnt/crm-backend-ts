@@ -7,7 +7,7 @@ import { atoi, queryParam } from "../../lib/query.js";
 import { pathParam, requestMetaFirstHop } from "../../lib/request-meta.js";
 import { created, ok, sendJson } from "../../lib/response.js";
 import { createRouter } from "../../lib/router.js";
-import { decodeJson, optionalString, str } from "../../lib/validate.js";
+import { decodeJson, optionalString, str, stringArray } from "../../lib/validate.js";
 import { jsonBody } from "../../middleware/errors.js";
 import { claimsOf } from "../auth/auth.middleware.js";
 import { inScope, type Guard } from "../auth/guard.js";
@@ -28,6 +28,7 @@ const requestSchema = z.strictObject({
   expiryDate: optionalString(),
   notes: str(),
   status: str(),
+  viewerUserIds: stringArray(),
 });
 
 const updateSchema = z.strictObject({
@@ -37,7 +38,27 @@ const updateSchema = z.strictObject({
   expiryDate: optionalString(),
   notes: optionalString(),
   status: optionalString(),
+  viewerUserIds: stringArray(),
 });
+
+/** Multipart may send viewerUserIds as JSON array or comma-separated UUIDs. */
+function parseViewerUserIds(form: MultipartForm): string[] | undefined {
+  const raw = form.value("viewerUserIds").trim();
+  if (raw === "") return undefined;
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("not an array");
+      return parsed.map((v) => String(v).trim()).filter((v) => v !== "");
+    } catch {
+      throw AppError.validation("invalid viewerUserIds");
+    }
+  }
+  return raw
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v !== "");
+}
 
 const rejectSchema = z.strictObject({ reason: str() });
 
@@ -96,7 +117,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     const input = decodeJson(req, requestSchema);
     const claims = claimsOf(req);
     await requireParents(db, claims, input);
-    created(res, await service.request(claims.userId, input, requestMetaFirstHop(req)));
+    created(res, await service.request(claims, input, requestMetaFirstHop(req)));
   });
 
   const upload = async (req: Request, res: Response) => {
@@ -137,9 +158,10 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       dealId: orUndefined(form.value("dealId")),
       expiryDate: orUndefined(form.value("expiryDate")),
       notes: form.value("notes"),
+      viewerUserIds: parseViewerUserIds(form),
     };
     await requireParents(db, claims, input);
-    created(res, await service.uploadNew(claims.userId, input, upload, meta));
+    created(res, await service.uploadNew(claims, input, upload, meta));
   };
 
   router.post("/api/v1/documents/upload", ...guard(...create), upload);
@@ -150,7 +172,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
 
   router.patch("/api/v1/documents/:id", ...guard(...edit), inScope(db, Records.Documents, edit), jsonBody, async (req, res) => {
     const input = decodeJson(req, updateSchema);
-    ok(res, await service.update(claimsOf(req).userId, pathParam(req, "id"), input, requestMetaFirstHop(req)));
+    ok(res, await service.update(claimsOf(req), pathParam(req, "id"), input, requestMetaFirstHop(req)));
   });
 
   router.delete("/api/v1/documents/:id", ...guard(...del), inScope(db, Records.Documents, del), async (req, res) => {

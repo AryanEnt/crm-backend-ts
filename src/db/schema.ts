@@ -335,6 +335,12 @@ export interface Documents {
   verified_by: string | null;
 }
 
+export interface DocumentViewers {
+  created_at: Generated<Timestamp>;
+  document_id: string;
+  user_id: string;
+}
+
 export interface EmailAccounts {
   avatar_url: Generated<string>;
   connection_status: Generated<string>;
@@ -880,6 +886,7 @@ export interface DB {
   deal_stage_transitions: DealStageTransitions;
   deals: Deals;
   documents: Documents;
+  document_viewers: DocumentViewers;
   email_accounts: EmailAccounts;
   email_attachments: EmailAttachments;
   email_messages: EmailMessages;

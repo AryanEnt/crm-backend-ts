@@ -27,8 +27,23 @@ export interface RecordSpec {
   where?: (where: Predicate[], v: Visibility, claims: Claims) => Predicate[];
 }
 
-/** A document is visible through the lead, customer or deal it belongs to, or to its uploader. */
+/**
+ * Document visibility:
+ * - Own-scope (SE): only docs shared via document_viewers, or ones they uploaded.
+ * - Team-scope (TL): parent lead/customer/deal in team, or uploader, or viewer ACL.
+ */
 function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predicate[] {
+  const shared = sql`EXISTS (
+    SELECT 1 FROM document_viewers dv
+    WHERE dv.document_id = d.id AND dv.user_id = ${claims.userId}::uuid
+  )`;
+  const uploaded = sql`d.uploaded_by = ${claims.userId}::uuid`;
+
+  const ownOnly = !v.unscoped && v.teamIds.length === 0 && v.ownerIds.length > 0;
+  if (ownOnly) {
+    return [...where, sql`(${uploaded} OR ${shared})`];
+  }
+
   const parents = [
     { column: "d.lead_id", from: "leads pl", alias: "pl" },
     { column: "d.customer_id", from: "customers pc", alias: "pc" },
@@ -41,7 +56,7 @@ function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predi
     });
     return sql`EXISTS (SELECT 1 FROM ${sql.raw(p.from)} WHERE ${and(sub)})`;
   });
-  via.push(sql`d.uploaded_by = ${claims.userId}::uuid`);
+  via.push(uploaded, shared);
   return [...where, sql`(${sql.join(via, sql` OR `)})`];
 }
 

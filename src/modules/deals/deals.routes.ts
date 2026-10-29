@@ -14,7 +14,7 @@ import { inScope, type Guard } from "../auth/guard.js";
 import type { Claims } from "../auth/types.js";
 import { applyOwnerFilter, resolve, type Visibility } from "../datascope/datascope.js";
 import { Records } from "../datascope/record.js";
-import { P, Role } from "../permissions/permissions.js";
+import { expandImplies, P, Role } from "../permissions/permissions.js";
 import type { DealsService } from "./deals.service.js";
 
 const createSchema = z.strictObject({
@@ -127,9 +127,13 @@ export function dealsRouter(service: DealsService, db: Database, guard: Guard): 
   });
 
   router.post("/api/v1/deals/:id/documents", ...guard(...edit), inScope(db, Records.Deals, edit), jsonBody, async (req, res) => {
+    const claims = claimsOf(req);
+    if (!expandImplies(claims.permissions).hasAny(P.DocumentsCreate)) {
+      throw AppError.forbidden("insufficient permissions");
+    }
     const { name, category } = decodeJson(req, documentSchema);
     const id = pathParam(req, "id");
-    await service.addDocument(claimsOf(req).userId, id, name, category);
+    await service.addDocument(claims.userId, id, name, category);
     ok(res, await service.getDetail(id));
   });
 

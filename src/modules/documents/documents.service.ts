@@ -11,8 +11,10 @@ import type { Claims } from "../auth/types.js";
 import type { AutomationEmitter } from "../automation/emitter.js";
 import { and, type Predicate, type Visibility } from "../datascope/datascope.js";
 import { appendRecordScope, Records } from "../datascope/record.js";
+import { Role } from "../permissions/permissions.js";
 import { newObjectKey, type Store } from "../storage/storage.js";
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
+import { isUuid } from "../../lib/uuid.js";
 
 export const DocumentStatus = {
   Requested: "requested",
@@ -54,6 +56,7 @@ export interface DocumentRecord {
   verifiedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  viewerUserIds: string[];
 }
 
 export interface DocumentListFilter {
@@ -79,6 +82,7 @@ export interface RequestDocumentInput {
   expiryDate: string | undefined;
   notes: string;
   status: string;
+  viewerUserIds: string[] | undefined;
 }
 
 export interface UpdateDocumentInput {
@@ -88,6 +92,7 @@ export interface UpdateDocumentInput {
   expiryDate: string | undefined;
   notes: string | undefined;
   status: string | undefined;
+  viewerUserIds: string[] | undefined;
 }
 
 export interface NewUpload {
@@ -99,6 +104,7 @@ export interface NewUpload {
   dealId: string | undefined;
   expiryDate: string | undefined;
   notes: string;
+  viewerUserIds: string[] | undefined;
 }
 
 export interface FileUpload {
@@ -116,7 +122,11 @@ const docSelect = sql`
     d.uploaded_by::text AS "uploadedBy", ub.full_name AS "uploadedByName",
     d.verified_by::text AS "verifiedBy", vb.full_name AS "verifiedByName",
     d.requested_at AS "requestedDate", d.uploaded_at AS "uploadedDate", d.expires_at AS "expiryDate",
-    d.verified_at AS "verifiedAt", d.created_at AS "createdAt", d.updated_at AS "updatedAt"
+    d.verified_at AS "verifiedAt", d.created_at AS "createdAt", d.updated_at AS "updatedAt",
+    COALESCE((
+      SELECT array_agg(dv.user_id::text ORDER BY dv.user_id)
+      FROM document_viewers dv WHERE dv.document_id = d.id
+    ), '{}'::text[]) AS "viewerUserIds"
   FROM documents d
   LEFT JOIN leads lead ON lead.id = d.lead_id
   LEFT JOIN customers c ON c.id = d.customer_id
@@ -158,7 +168,9 @@ export class DocumentsRepository {
 
   async get(id: string): Promise<DocumentRecord | null> {
     const r = await sql<DocumentRecord>`${docSelect} WHERE d.id = ${id}`.execute(this.db);
-    return r.rows[0] ?? null;
+    const row = r.rows[0];
+    if (!row) return null;
+    return { ...row, viewerUserIds: Array.isArray(row.viewerUserIds) ? row.viewerUserIds : [] };
   }
 
   async list(f: DocumentListFilter): Promise<{ items: DocumentRecord[]; total: number }> {
@@ -180,7 +192,13 @@ export class DocumentsRepository {
       WHERE ${and(where)}
       ORDER BY COALESCE(d.uploaded_at, d.requested_at, d.created_at) DESC
       LIMIT ${limit} OFFSET ${f.offset}`.execute(this.db);
-    return { items: rows.rows, total: count.rows[0]?.total ?? 0 };
+    return {
+      items: rows.rows.map((row) => ({
+        ...row,
+        viewerUserIds: Array.isArray(row.viewerUserIds) ? row.viewerUserIds : [],
+      })),
+      total: count.rows[0]?.total ?? 0,
+    };
   }
 
   async insertRequested(in_: RequestDocumentInput, expires: Date | null, status: string): Promise<DocumentRecord | null> {
@@ -265,6 +283,60 @@ export class DocumentsRepository {
     await sql`DELETE FROM documents WHERE id = ${id}`.execute(this.db);
   }
 
+  async replaceViewers(documentId: string, userIds: string[]): Promise<void> {
+    await sql`DELETE FROM document_viewers WHERE document_id = ${documentId}`.execute(this.db);
+    for (const userId of userIds) {
+      await sql`
+        INSERT INTO document_viewers (document_id, user_id)
+        VALUES (${documentId}, ${userId})
+        ON CONFLICT DO NOTHING`.execute(this.db);
+    }
+  }
+
+  /**
+   * Viewer IDs must be active Sales Executives on the caller's team
+   * (any team for Super Admin).
+   */
+  async resolveViewerIds(claims: Claims, raw: string[] | undefined): Promise<string[]> {
+    if (raw === undefined) return [];
+    const unique: string[] = [];
+    for (const id of raw) {
+      const trimmed = id.trim();
+      if (trimmed === "") continue;
+      if (!isUuid(trimmed)) throw AppError.validation("invalid viewerUserIds");
+      if (!unique.includes(trimmed)) unique.push(trimmed);
+    }
+    if (unique.length === 0) return [];
+
+    let rows: { id: string }[];
+    if (claims.roleCode === Role.SuperAdmin) {
+      const r = await sql<{ id: string }>`
+        SELECT u.id::text AS id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE u.id = ANY(${unique}::uuid[])
+          AND u.is_active = TRUE
+          AND r.code = ${Role.SalesExecutive}`.execute(this.db);
+      rows = r.rows;
+    } else {
+      if (claims.teamIds.length === 0) throw AppError.validation("viewerUserIds must be Sales Executives on your team");
+      const r = await sql<{ id: string }>`
+        SELECT DISTINCT u.id::text AS id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        JOIN team_members tm ON tm.user_id = u.id
+        WHERE u.id = ANY(${unique}::uuid[])
+          AND u.is_active = TRUE
+          AND r.code = ${Role.SalesExecutive}
+          AND tm.team_id = ANY(${claims.teamIds}::uuid[])`.execute(this.db);
+      rows = r.rows;
+    }
+    if (rows.length !== unique.length) {
+      throw AppError.validation("viewerUserIds must be Sales Executives on your team");
+    }
+    return unique;
+  }
+
   async refreshExpired(): Promise<void> {
     await sql`
       UPDATE documents SET status = 'expired'
@@ -317,43 +389,41 @@ export class DocumentsService {
     return d;
   }
 
-  async request(actorId: string, in_: RequestDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
+  async request(claims: Claims, in_: RequestDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
     if (in_.name.trim() === "") throw AppError.validation("name is required");
-    if (!blankToNull(in_.leadId) && !blankToNull(in_.customerId) && !blankToNull(in_.dealId)) {
-      throw AppError.validation("document must belong to a lead, customer, or deal");
-    }
+    const viewers = await this.repo.resolveViewerIds(claims, in_.viewerUserIds);
     const status = in_.status === DocumentStatus.Missing ? DocumentStatus.Missing : DocumentStatus.Requested;
     const expires = parseExpiry(in_.expiryDate);
     const d = await internal("failed to request document", async () => {
       const row = await this.repo.insertRequested(in_, expires, status);
       if (!row) throw new Error("inserted document not found");
-      return row;
+      await this.repo.replaceViewers(row.id, viewers);
+      return (await this.repo.get(row.id)) ?? row;
     });
-    await this.audit.record(actorId, "document.requested", "document", d.id, { name: d.name, type: d.type, status: d.status }, meta);
-    await this.emit(actorId, TimelineEvent.DocumentRequested, "Document requested", `${d.name} (${d.type})`, d);
+    await this.audit.record(claims.userId, "document.requested", "document", d.id, { name: d.name, type: d.type, status: d.status, viewerUserIds: viewers }, meta);
+    await this.emit(claims.userId, TimelineEvent.DocumentRequested, "Document requested", `${d.name} (${d.type})`, d);
     return d;
   }
 
-  async uploadNew(actorId: string, in_: NewUpload, file: FileUpload, meta: RequestMeta): Promise<DocumentRecord> {
+  async uploadNew(claims: Claims, in_: NewUpload, file: FileUpload, meta: RequestMeta): Promise<DocumentRecord> {
     const input = { ...in_, name: in_.name.trim() === "" ? file.filename : in_.name };
     if (input.name.trim() === "") throw AppError.validation("name is required");
-    if (!blankToNull(input.leadId) && !blankToNull(input.customerId) && !blankToNull(input.dealId)) {
-      throw AppError.validation("document must belong to a lead, customer, or deal");
-    }
+    const viewers = await this.repo.resolveViewerIds(claims, in_.viewerUserIds);
     const expires = parseExpiry(input.expiryDate);
     const dest = this.destination(input.type, input.category, input.customerId, input.dealId, input.leadId);
     const stored = await this.put(dest.store, dest.prefix, file);
     let d: DocumentRecord;
     try {
-      const row = await this.repo.createUploaded(input, actorId, stored, expires);
+      const row = await this.repo.createUploaded(input, claims.userId, stored, expires);
       if (!row) throw new Error("inserted document not found");
-      d = row;
+      await this.repo.replaceViewers(row.id, viewers);
+      d = (await this.repo.get(row.id)) ?? row;
     } catch (err) {
       await dest.store.delete(stored.key).catch(() => undefined);
       throw AppError.internal("failed to save document", err);
     }
-    await this.audit.record(actorId, "document.uploaded", "document", d.id, { name: d.name, type: d.type, size: d.sizeBytes }, meta);
-    await this.afterUpload(actorId, d);
+    await this.audit.record(claims.userId, "document.uploaded", "document", d.id, { name: d.name, type: d.type, size: d.sizeBytes, viewerUserIds: viewers }, meta);
+    await this.afterUpload(claims.userId, d);
     return d;
   }
 
@@ -439,14 +509,21 @@ export class DocumentsService {
     return d;
   }
 
-  async update(actorId: string, id: string, in_: UpdateDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
+  async update(claims: Claims, id: string, in_: UpdateDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
     const current = await this.get(id);
     let expires: Date | null = null;
     const setExpires = in_.expiryDate !== undefined;
     if (setExpires) expires = parseExpiry(in_.expiryDate);
     if (in_.status !== undefined && !VALID_STATUSES.has(in_.status)) throw AppError.validation("invalid status");
-    const d = await this.mutate("failed to update document", () => this.repo.updateMeta(id, current, in_, expires, setExpires));
-    await this.audit.record(actorId, "document.updated", "document", id, { name: d.name, status: d.status }, meta);
+    const viewers =
+      in_.viewerUserIds !== undefined ? await this.repo.resolveViewerIds(claims, in_.viewerUserIds) : undefined;
+    const d = await this.mutate("failed to update document", async () => {
+      const row = await this.repo.updateMeta(id, current, in_, expires, setExpires);
+      if (!row) return null;
+      if (viewers !== undefined) await this.repo.replaceViewers(id, viewers);
+      return (await this.repo.get(id)) ?? row;
+    });
+    await this.audit.record(claims.userId, "document.updated", "document", id, { name: d.name, status: d.status, viewerUserIds: viewers }, meta);
     return d;
   }
 
