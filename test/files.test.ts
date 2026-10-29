@@ -119,7 +119,7 @@ describe("files and referrals routes validate before touching data", () => {
     const res = await request(app(f)).get("/api/v1/timeline/types").set("Authorization", bearer());
     expect(res.headers["content-type"]).toBe("application/json");
     expect(res.text.endsWith("}\n")).toBe(true);
-    expect(res.body.data).toHaveLength(17);
+    expect(res.body.data).toHaveLength(12);
     expect(res.body.data[0]).toEqual({ code: expect.any(String), label: expect.any(String) });
     expect(f.queries.length).toBe(4);
   });

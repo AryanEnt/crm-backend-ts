@@ -95,25 +95,24 @@ export interface ExternalWriteInput {
 
 const EXTERNAL_SOURCES = new Set(["whatsapp", "twilio", "email", "automation", "external", "system"]);
 
-/** Codes and labels served by GET /timeline/types, in Go's order. */
+/**
+ * Filter options for GET /timeline/types (lead/customer timeline UI).
+ * Lifecycle noise (customer/deal/activity created, automation) stays off the filter;
+ * those events still appear under "All events" when recorded.
+ */
 export const TIMELINE_EVENT_TYPES = [
-  { code: TimelineEvent.LeadCreated, label: "Lead created" },
-  { code: TimelineEvent.CustomerCreated, label: "Customer created" },
-  { code: TimelineEvent.DealCreated, label: "Deal created" },
-  { code: TimelineEvent.ActivityCreated, label: "Activity created" },
-  { code: TimelineEvent.ActivityCompleted, label: "Activity completed" },
   { code: TimelineEvent.Call, label: "Call" },
-  { code: TimelineEvent.WhatsApp, label: "WhatsApp message" },
+  { code: TimelineEvent.WhatsApp, label: "WhatsApp" },
   { code: TimelineEvent.Email, label: "Email" },
   { code: TimelineEvent.Meeting, label: "Meeting" },
   { code: TimelineEvent.Note, label: "Note" },
+  { code: TimelineEvent.ActivityCompleted, label: "Activity completed" },
   { code: TimelineEvent.StageChange, label: "Stage change" },
   { code: TimelineEvent.AssignmentChange, label: "Assignment change" },
   { code: TimelineEvent.DocumentRequested, label: "Document requested" },
   { code: TimelineEvent.DocumentUploaded, label: "Document uploaded" },
   { code: TimelineEvent.DocumentVerified, label: "Document verified" },
   { code: TimelineEvent.DocumentRejected, label: "Document rejected" },
-  { code: TimelineEvent.Automation, label: "Automation event" },
 ];
 
 const blankToNull = (v: string | null | undefined): string | null => (v && v.trim() !== "" ? v : null);
