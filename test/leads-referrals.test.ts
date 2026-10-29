@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { Database } from "../src/db/database.js";
 import type { AuditService } from "../src/modules/audit/audit.service.js";
 import { LeadsRepository, type LeadListFilter } from "../src/modules/leads/leads.service.js";
-import { ReferralsService, type ReferralListFilter } from "../src/modules/referrals/referrals.service.js";
+import {
+  referralVisible,
+  ReferralsService,
+  type Referral,
+  type ReferralListFilter,
+} from "../src/modules/referrals/referrals.service.js";
 import { fakeDb } from "./helpers/fake-db.js";
 
 const leadFilter = (sort: string): LeadListFilter => ({
@@ -41,7 +46,7 @@ const referralFilter = (sort: string): ReferralListFilter => ({
   statusCode: "",
   dateFrom: "",
   dateTo: "",
-  scopeOwnerIds: [],
+  scopeCreatedByIds: [],
   scopeTeamIds: [],
   unscoped: true,
   sort,
@@ -170,5 +175,42 @@ describe("referrer profile", () => {
       convertedReferrals: 0,
       history: null,
     });
+  });
+});
+
+describe("referral visibility", () => {
+  const ref = (over: Partial<Referral> = {}): Referral =>
+    ({
+      id: "r1",
+      leadId: "l1",
+      customerId: null,
+      createdByUserId: "se-1",
+      teamId: "team-a",
+      ...over,
+    }) as Referral;
+
+  it("lets an SE see only referrals they added", () => {
+    const own = { unscoped: false, scopeCreatedByIds: ["se-1"], scopeTeamIds: [] };
+    expect(referralVisible(ref(), own)).toBe(true);
+    expect(referralVisible(ref({ createdByUserId: "se-2" }), own)).toBe(false);
+    // Same team is not enough for SE own-scope.
+    expect(referralVisible(ref({ createdByUserId: "se-2", teamId: "team-a" }), own)).toBe(false);
+  });
+
+  it("lets a team lead see referrals added by the team or on the team", () => {
+    const team = {
+      unscoped: false,
+      scopeCreatedByIds: ["se-1", "se-2", "tl-1"],
+      scopeTeamIds: ["team-a"],
+    };
+    expect(referralVisible(ref({ createdByUserId: "se-2" }), team)).toBe(true);
+    expect(referralVisible(ref({ createdByUserId: "outsider", teamId: "team-a" }), team)).toBe(true);
+    expect(referralVisible(ref({ createdByUserId: "outsider", teamId: "team-b" }), team)).toBe(false);
+  });
+
+  it("lets admins see everything when unscoped", () => {
+    expect(referralVisible(ref({ createdByUserId: "anyone" }), { unscoped: true, scopeCreatedByIds: [], scopeTeamIds: [] })).toBe(
+      true,
+    );
   });
 });

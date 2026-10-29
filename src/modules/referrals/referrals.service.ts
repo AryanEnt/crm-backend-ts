@@ -137,8 +137,12 @@ export interface ReferralListFilter {
   statusCode: string;
   dateFrom: string;
   dateTo: string;
-  /** Without referrals:manage: restricted to these owners / teams. */
-  scopeOwnerIds: string[];
+  /**
+   * Visibility without referrals:manage:
+   * - Sales Executive: referrals they added (`created_by` in scopeCreatedByIds)
+   * - Team Lead: created by a team member, or linked lead/customer on their team
+   */
+  scopeCreatedByIds: string[];
   scopeTeamIds: string[];
   unscoped: boolean;
   sort: string;
@@ -220,13 +224,29 @@ function listWhere(f: ReferralListFilter) {
   if (f.statusCode !== "") parts.push(sql`rs.code = ${f.statusCode}`);
   if (f.dateFrom !== "") parts.push(sql`r.referral_date >= ${f.dateFrom}::date`);
   if (f.dateTo !== "") parts.push(sql`r.referral_date <= ${f.dateTo}::date`);
-  if (!f.unscoped && (f.scopeOwnerIds.length > 0 || f.scopeTeamIds.length > 0)) {
+  if (!f.unscoped) {
     const scope = [];
-    if (f.scopeOwnerIds.length > 0) scope.push(sql`COALESCE(c.owner_user_id, l.owner_user_id) = ANY(${f.scopeOwnerIds}::uuid[])`);
-    if (f.scopeTeamIds.length > 0) scope.push(sql`COALESCE(c.team_id, l.team_id) = ANY(${f.scopeTeamIds}::uuid[])`);
-    parts.push(sql`(${sql.join(scope, sql` OR `)})`);
+    if (f.scopeCreatedByIds.length > 0) {
+      scope.push(sql`r.created_by_user_id = ANY(${f.scopeCreatedByIds}::uuid[])`);
+    }
+    if (f.scopeTeamIds.length > 0) {
+      scope.push(sql`COALESCE(c.team_id, l.team_id) = ANY(${f.scopeTeamIds}::uuid[])`);
+    }
+    parts.push(scope.length > 0 ? sql`(${sql.join(scope, sql` OR `)})` : sql`FALSE`);
   }
   return sql.join(parts, sql` AND `);
+}
+
+/** Whether a loaded referral is visible under the same rules as the list filter. */
+export function referralVisible(ref: Referral, f: Pick<ReferralListFilter, "unscoped" | "scopeCreatedByIds" | "scopeTeamIds">): boolean {
+  if (f.unscoped) return true;
+  if (f.scopeCreatedByIds.length > 0 && ref.createdByUserId && f.scopeCreatedByIds.includes(ref.createdByUserId)) {
+    return true;
+  }
+  if (f.scopeTeamIds.length > 0 && ref.teamId && f.scopeTeamIds.includes(ref.teamId)) {
+    return true;
+  }
+  return false;
 }
 
 /** Go omitempty on CatalogItem.isConverted: only present when true. */
@@ -411,9 +431,13 @@ export class ReferralsService {
     });
   }
 
-  async get(id: string): Promise<Referral> {
+  async get(
+    id: string,
+    access?: Pick<ReferralListFilter, "unscoped" | "scopeCreatedByIds" | "scopeTeamIds">,
+  ): Promise<Referral> {
     const ref = await internal("failed to load referral", () => this.one(sql`r.id = ${id}`));
     if (!ref) throw AppError.notFound("referral not found");
+    if (access && !referralVisible(ref, access)) throw AppError.notFound("referral not found");
     return ref;
   }
 
@@ -467,7 +491,7 @@ export class ReferralsService {
       statusCode: "",
       dateFrom: "",
       dateTo: "",
-      scopeOwnerIds: [],
+      scopeCreatedByIds: [],
       scopeTeamIds: [],
       unscoped: true,
       sort: "",

@@ -129,6 +129,8 @@ export interface FollowUpRequest {
   leadId?: string | null;
   customerId?: string | null;
   dealId?: string | null;
+  /** Defaults to the actor when omitted. */
+  ownerUserId?: string | null;
 }
 
 export interface ActivityListFilter {
@@ -256,7 +258,11 @@ export class ActivitiesRepository {
     where = appendScope(where, f.scope, Records.Activities.columns);
     if (f.typeCode !== "") where.push(sql`a.kind = ${f.typeCode}`);
     if (f.pipelineId !== "") where.push(sql`COALESCE(d.pipeline_id, l.pipeline_id)::text = ${f.pipelineId}`);
-    if (f.hideStageChanges) where.push(sql`a.kind <> 'stage_change'`);
+    if (f.hideStageChanges) {
+      where.push(sql`a.kind <> 'stage_change'`);
+      // Reset/reschedule cancels the old follow-up; keep it off the calendar unless filtered in.
+      if (f.status === "" || f.status === "all") where.push(sql`a.status <> 'cancelled'`);
+    }
     if (f.status !== "" && f.status !== "all") {
       if (f.status === "overdue") {
         where.push(sql`a.status IN ('upcoming','due','overdue') AND a.due_at IS NOT NULL AND a.due_at < NOW()`);
@@ -280,6 +286,32 @@ export class ActivitiesRepository {
     return { items: rows.rows.map(toActivity), total: count.rows[0]?.total ?? 0 };
   }
 
+  /**
+   * Drops superseded follow-ups from the calendar when a new one is scheduled
+   * (or the lead next-action date is cleared). Meetings/calls are left alone.
+   */
+  async cancelOpenFollowUps(opts: {
+    leadId?: string | null;
+    customerId?: string | null;
+    dealId?: string | null;
+    exceptId?: string | null;
+  }): Promise<number> {
+    const leadId = opts.leadId?.trim() ?? "";
+    const customerId = opts.customerId?.trim() ?? "";
+    const dealId = opts.dealId?.trim() ?? "";
+    if (leadId === "" && customerId === "" && dealId === "") return 0;
+    const except = opts.exceptId?.trim() ?? "";
+    const r = await sql`
+      UPDATE activities SET status = 'cancelled', updated_at = NOW()
+      WHERE kind = 'follow_up'
+        AND status IN ('upcoming', 'due', 'overdue')
+        AND (${leadId}::text = '' OR lead_id::text = ${leadId})
+        AND (${customerId}::text = '' OR customer_id::text = ${customerId})
+        AND (${dealId}::text = '' OR deal_id::text = ${dealId})
+        AND (${except}::text = '' OR id::text <> ${except})`.execute(this.db);
+    return Number(r.numAffectedRows ?? 0);
+  }
+
   async create(
     actorId: string,
     in_: CreateActivityInput,
@@ -296,6 +328,10 @@ export class ActivitiesRepository {
     const owner = blankToNull(in_.ownerUserId) ?? actorId;
     const completed = status === "completed";
     const [leadId, customerId, dealId] = [in_.leadId, in_.customerId, in_.dealId].map(blankToNull);
+    const open = status === "upcoming" || status === "due" || status === "overdue";
+    if (open && typ.code === "follow_up") {
+      await this.cancelOpenFollowUps({ leadId, customerId, dealId });
+    }
     await sql`
       INSERT INTO activities (
         id, kind, activity_type_id, title, subject, body, status, priority, outcome,
@@ -719,10 +755,21 @@ export class ActivitiesService {
     await internal("failed to update timezone", () => this.repo.setUserTimezone(userId, tz));
   }
 
-  /** Creates the next follow-up for a completed activity or a deal move; returns its id. */
+  /** Cancels open follow-ups for a lead/customer/deal so the calendar drops the old date. */
+  async cancelOpenFollowUps(opts: {
+    leadId?: string | null;
+    customerId?: string | null;
+    dealId?: string | null;
+    exceptId?: string | null;
+  }): Promise<number> {
+    return internal("failed to cancel follow-ups", () => this.repo.cancelOpenFollowUps(opts));
+  }
+
+  /** Creates the next follow-up for a completed activity, deal/lead move, or lead create; returns its id. */
   async scheduleFollowUp(actorId: string, in_: FollowUpRequest, meta: RequestMeta): Promise<string> {
     const due = in_.next.dueAt.trim();
     if (due === "") throw AppError.validation("dueAt is required");
+    // create() cancels prior open follow_ups for the same parent when type is follow_up.
     const a = await this.create(
       actorId,
       {
@@ -736,6 +783,7 @@ export class ActivitiesService {
         status: "upcoming",
         priority: "",
         dueAt: due,
+        ownerUserId: in_.ownerUserId?.trim() || undefined,
         leadId: in_.leadId ?? undefined,
         customerId: in_.customerId ?? undefined,
         dealId: in_.dealId ?? undefined,

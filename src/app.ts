@@ -109,7 +109,7 @@ export function createApp({ config, db, store = createStore(config.storageDriver
   const activityTypes = new ActivityTypesService(db, audit);
   const activities = new ActivitiesService(db, activityTypes.repo, audit, timeline, automation, systemActivity);
   const leadStages = new LeadStageService(db, pipelines.repo, activities, () => automation.wake());
-  const leads = new LeadsService(db, audit, timeline, automation, referrals, customFields, systemActivity, leadStages);
+  const leads = new LeadsService(db, audit, timeline, automation, referrals, customFields, systemActivity, leadStages, activities);
   app.use(leadInsightsRouter(new LeadInsightsService(db, pipelines.repo), guard));
   app.use(leadsRouter(leads, db, guard));
   const customers = new CustomersService(db, leads.repo, audit, timeline, automation, referrals, customFields, systemActivity);

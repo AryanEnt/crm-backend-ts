@@ -17,6 +17,7 @@ import type { Stage } from "../pipelines/pipelines.service.js";
 import { isReferralSource, validateReferral, type ReferralInput, type ReferralsService } from "../referrals/referrals.service.js";
 import type { SystemActivityService } from "../system-activity/system-activity.service.js";
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
+import type { FollowUpScheduler } from "./lead-stage.service.js";
 import { leadActivityPredicate, leadValuePredicates, type LeadStageService } from "./lead-stage.service.js";
 
 export interface BulkStageResult {
@@ -378,10 +379,15 @@ export class LeadsRepository {
       case "all":
         break;
       case "closed":
-        where.push(sql`l.status IN ('won','lost')`);
+        // Timestamps survive the Sales → Nurturing handoff (status becomes open again).
+        where.push(sql`(l.won_at IS NOT NULL OR l.lost_at IS NOT NULL)`);
         break;
       case "won":
+        where.push(sql`l.won_at IS NOT NULL`);
+        break;
       case "lost":
+        where.push(sql`l.lost_at IS NOT NULL`);
+        break;
       case "inbox":
       case "open":
       case "qualified":
@@ -582,8 +588,35 @@ export class LeadsService {
     private readonly customFields: CustomFieldsService,
     private readonly sysActivity: SystemActivityService,
     readonly stages: LeadStageService,
+    /** Creates a calendar activity when a lead follow-up date is set. */
+    private readonly followUps: FollowUpScheduler | null = null,
   ) {
     this.repo = new LeadsRepository(db);
+  }
+
+  /**
+   * Lead next_activity_at alone does not appear on the calendar — that list is activities.
+   * Schedule a follow-up activity so "When to follow up?" on create/edit shows up there.
+   * Prior open follow-ups are cancelled inside scheduleFollowUp so Reset doesn't leave ghosts.
+   */
+  private async scheduleLeadFollowUp(actorId: string, lead: Lead, due: Date, meta: RequestMeta): Promise<void> {
+    if (!this.followUps) return;
+    await this.followUps
+      .scheduleFollowUp(
+        actorId,
+        {
+          next: { title: "Follow up", dueAt: due.toISOString(), typeCode: "follow_up" },
+          leadId: lead.id,
+          ownerUserId: lead.ownerUserId,
+        },
+        meta,
+      )
+      .catch(() => undefined);
+  }
+
+  private async clearLeadFollowUps(leadId: string): Promise<void> {
+    if (!this.followUps) return;
+    await this.followUps.cancelOpenFollowUps({ leadId }).catch(() => undefined);
   }
 
   /** Resolves where a new lead starts: the requested open stage, else the default lead pipeline. */
@@ -699,6 +732,7 @@ export class LeadsService {
       entityLabel: lead.fullName,
       metadata: { source: lead.source },
     });
+    if (nextAt) await this.scheduleLeadFollowUp(actorId, lead, nextAt, meta);
     return { lead };
   }
 
@@ -809,6 +843,14 @@ export class LeadsService {
     }
     if (in_.customFields && Object.keys(in_.customFields).length > 0) {
       await this.customFields.setValues(actorId, "lead", id, in_.customFields).catch(() => undefined);
+    }
+    // New/changed follow-up → replace calendar activity; cleared date → drop open follow-ups.
+    if (in_.nextActivityAt !== undefined) {
+      if (nextAt && (cur.nextActivityAt === null || cur.nextActivityAt.getTime() !== nextAt.getTime())) {
+        await this.scheduleLeadFollowUp(actorId, lead, nextAt, meta);
+      } else if (!nextAt) {
+        await this.clearLeadFollowUps(id);
+      }
     }
     return { lead };
   }

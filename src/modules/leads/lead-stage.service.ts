@@ -58,6 +58,12 @@ export interface MoveOutcome {
 
 export interface FollowUpScheduler {
   scheduleFollowUp(actorId: string, in_: FollowUpRequest, meta: RequestMeta): Promise<string>;
+  cancelOpenFollowUps(opts: {
+    leadId?: string | null;
+    customerId?: string | null;
+    dealId?: string | null;
+    exceptId?: string | null;
+  }): Promise<number>;
 }
 
 /** Who is moving the lead; automation runs without a request or user scope. */
@@ -640,9 +646,11 @@ export class LeadStageService {
 
   // ---------------------------------------------------------------- board
 
-  private boardWhere(f: Omit<BoardFilter, "limit">): Predicate[] {
+  private boardWhere(f: Omit<BoardFilter, "limit">, opts: { pipelineScoped?: boolean } = {}): Predicate[] {
     if (!VALID_ACTIVITY_FILTERS.has(f.activity)) throw AppError.validation("invalid activity filter");
-    const where: Predicate[] = [sql`l.pipeline_id::text = ${f.pipelineId}`, sql`l.is_archived = FALSE`];
+    const pipelineScoped = opts.pipelineScoped !== false;
+    const where: Predicate[] = [sql`l.is_archived = FALSE`];
+    if (pipelineScoped) where.push(sql`l.pipeline_id::text = ${f.pipelineId}`);
     if (f.search !== "") {
       const like = `%${f.search}%`;
       where.push(
@@ -658,6 +666,19 @@ export class LeadStageService {
     if (activity) where.push(activity);
     where.push(...leadValuePredicates(f.minValue, f.maxValue));
     return appendScope(where, f.scope, Records.Leads.columns);
+  }
+
+  /**
+   * Sales Won hands leads into Nurturing (they leave this pipeline). The sales Won column
+   * still lists them by won_at so the board and Won table stay consistent.
+   */
+  private salesWonStage(pipelineId: string, stages: { id: string; isActive: boolean; isWon: boolean }[]) {
+    if (pipelineId === NURTURING_PIPELINE_ID) return null;
+    return stages.find((s) => s.isActive && s.isWon) ?? null;
+  }
+
+  private wonAtWhere(f: Omit<BoardFilter, "limit">): Predicate[] {
+    return [...this.boardWhere(f, { pipelineScoped: false }), sql`l.won_at IS NOT NULL`];
   }
 
   private async cards(where: Predicate[], perStage: number, offset: number): Promise<BoardCard[]> {
@@ -699,20 +720,67 @@ export class LeadStageService {
     return r.rows.map(({ rn: _rn, ...card }) => card);
   }
 
+  /** Won column page: ordered by win date, not current stage (leads may live in Nurturing). */
+  private async wonAtCards(where: Predicate[], limit: number, offset: number): Promise<BoardCard[]> {
+    const r = await sql<BoardCard>`
+      SELECT l.id::text AS "id", l.full_name AS "fullName", l.employer, l.phone, l.email,
+        l.potential_value AS "potentialValue", l.currency, l.stage_id::text AS "stageId", l.status,
+        l.owner_user_id::text AS "ownerUserId", ou.full_name AS "ownerName", l.priority, COALESCE(l.tags, '{}') AS "tags",
+        l.last_activity_at AS "lastActivityAt", l.next_activity_at AS "nextActivityAt",
+        na.title AS "nextActivityTitle", na.type_code AS "nextActivityType",
+        CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
+        COALESCE(l.stage_entered_at, l.created_at) AS "stageEnteredAt",
+        l.won_at AS "wonAt", l.lost_at AS "lostAt", l.lost_reason AS "lostReason",
+        dd.deadline AS "documentDeadlineAt"
+      FROM leads l
+      LEFT JOIN users ou ON ou.id = l.owner_user_id
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(NULLIF(a.title, ''), NULLIF(a.subject, ''), t.name, 'Follow up') AS title, t.code AS type_code
+        FROM activities a
+        LEFT JOIN activity_types t ON t.id = a.activity_type_id
+        WHERE a.lead_id = l.id AND a.status IN ('upcoming', 'due', 'overdue')
+        ORDER BY a.due_at ASC NULLS LAST
+        LIMIT 1
+      ) na ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT MIN(d.expires_at) AS deadline
+        FROM documents d
+        WHERE d.lead_id = l.id
+          AND d.expires_at IS NOT NULL
+          AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
+      ) dd ON TRUE
+      WHERE ${and(where)}
+      ORDER BY l.won_at DESC NULLS LAST, l.id
+      LIMIT ${limit} OFFSET ${offset}`.execute(this.db);
+    return r.rows;
+  }
+
   async board(f: BoardFilter): Promise<LeadBoard> {
     const pipeline = await internal("failed to load pipeline", () => this.pipelines.get(f.pipelineId));
     if (!pipeline) throw AppError.notFound("pipeline not found");
     if (pipeline.kind !== "leads") throw AppError.validation("pipeline is not a lead pipeline");
     const limit = clampLimit(f.limit);
     const where = this.boardWhere(f);
+    const wonStage = this.salesWonStage(f.pipelineId, pipeline.stages);
+    const wonWhere = wonStage ? this.wonAtWhere(f) : null;
 
-    const [totals, cards] = await Promise.all([
+    const [totals, cards, wonTotal, wonCards] = await Promise.all([
       internal("failed to load board", () =>
         sql<{ stageId: string | null; count: number; totalValue: number }>`
           SELECT l.stage_id::text AS "stageId", COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
           FROM leads l WHERE ${and(where)} GROUP BY l.stage_id`.execute(this.db),
       ),
       internal("failed to load board", () => this.cards(where, limit, 0)),
+      wonWhere
+        ? internal("failed to load won totals", () =>
+            sql<{ count: number; totalValue: number }>`
+              SELECT COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
+              FROM leads l WHERE ${and(wonWhere)}`.execute(this.db),
+          )
+        : Promise.resolve(null),
+      wonWhere
+        ? internal("failed to load won cards", () => this.wonAtCards(wonWhere, limit, 0))
+        : Promise.resolve([] as BoardCard[]),
     ]);
     const totalsByStage = new Map(totals.rows.map((t) => [t.stageId ?? "", t]));
     const cardsByStage = new Map<string, BoardCard[]>();
@@ -720,9 +788,34 @@ export class LeadStageService {
       const key = c.stageId ?? "";
       cardsByStage.set(key, [...(cardsByStage.get(key) ?? []), c]);
     }
+    const wonCount = wonTotal?.rows[0]?.count ?? 0;
+    const wonValue = Number(wonTotal?.rows[0]?.totalValue ?? 0);
+    // Pin cards to the sales Won stage so the column renders them even after Nurturing handoff.
+    const wonLeads = wonStage
+      ? wonCards.map((c) => ({ ...c, stageId: wonStage.id, status: c.wonAt ? "won" : c.status }))
+      : [];
+
     const stages = pipeline.stages
       .filter((s) => s.isActive)
       .map((s): BoardStage => {
+        if (wonStage && s.id === wonStage.id) {
+          return {
+            id: s.id,
+            name: s.name,
+            position: s.position,
+            isWon: s.isWon,
+            isLost: s.isLost,
+            probability: s.probability,
+            visualAccent: s.visualAccent,
+            requiredFields: s.requiredFields,
+            requiredActivities: s.requiredActivities,
+            requiredDocuments: s.requiredDocuments,
+            count: wonCount,
+            totalValue: wonValue,
+            hasMore: wonCount > wonLeads.length,
+            leads: wonLeads,
+          };
+        }
         const t = totalsByStage.get(s.id);
         const leads = cardsByStage.get(s.id) ?? [];
         const count = t?.count ?? 0;
@@ -752,6 +845,21 @@ export class LeadStageService {
   /** One more page of a single board column. */
   async boardStage(f: BoardFilter, stageId: string, offset: number): Promise<{ leads: BoardCard[]; hasMore: boolean }> {
     const limit = clampLimit(f.limit);
+    const pipeline = await internal("failed to load pipeline", () => this.pipelines.get(f.pipelineId));
+    if (!pipeline) throw AppError.notFound("pipeline not found");
+    const wonStage = this.salesWonStage(f.pipelineId, pipeline.stages);
+    if (wonStage && stageId === wonStage.id) {
+      const where = this.wonAtWhere(f);
+      const rows = await internal("failed to load board", () =>
+        this.wonAtCards(where, limit + 1, Math.max(0, offset)),
+      );
+      const leads = rows.slice(0, limit).map((c) => ({
+        ...c,
+        stageId: wonStage.id,
+        status: c.wonAt ? "won" : c.status,
+      }));
+      return { leads, hasMore: rows.length > limit };
+    }
     const where = [...this.boardWhere(f), sql`l.stage_id::text = ${stageId}`];
     const leads = await internal("failed to load board", () => this.cards(where, limit + 1, Math.max(0, offset)));
     return { leads: leads.slice(0, limit), hasMore: leads.length > limit };

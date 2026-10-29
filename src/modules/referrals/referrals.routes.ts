@@ -8,7 +8,9 @@ import { createRouter } from "../../lib/router.js";
 import { decodeJson, optionalString } from "../../lib/validate.js";
 import { jsonBody } from "../../middleware/errors.js";
 import { claimsOf } from "../auth/auth.middleware.js";
+import type { Claims } from "../auth/types.js";
 import type { Guard } from "../auth/guard.js";
+import { effectiveScope } from "../datascope/datascope.js";
 import { expandImplies, P, Role } from "../permissions/permissions.js";
 import {
   partnerInputSchema,
@@ -24,10 +26,45 @@ const createSchema = z.strictObject({
   ...referralInputSchema.shape,
 });
 
-/** Callers without referrals:manage see referrals whose lead/customer they own or share a team with. */
+type ReferralAccess = Pick<ReferralListFilter, "unscoped" | "scopeCreatedByIds" | "scopeTeamIds">;
+
+/**
+ * Referral visibility:
+ * - Super Admin / referrals:manage / org scope → all
+ * - Team Lead (team scope) → added by a team member, or linked lead/customer on their team
+ * - Sales Executive (own) → only referrals they added (created_by)
+ */
+function referralAccess(claims: Claims): ReferralAccess {
+  if (expandImplies(claims.permissions).has(P.ReferralsManage) || claims.roleCode === Role.SuperAdmin) {
+    return { unscoped: true, scopeCreatedByIds: [], scopeTeamIds: [] };
+  }
+  let scope: "own" | "team" | "organization";
+  try {
+    scope = effectiveScope(claims, P.ReferralsView);
+  } catch {
+    scope = claims.roleCode === Role.SalesManager ? "team" : "own";
+  }
+  if (scope === "organization") {
+    return { unscoped: true, scopeCreatedByIds: [], scopeTeamIds: [] };
+  }
+  if (scope === "team") {
+    const creators =
+      claims.teamMemberUserIds.length > 0
+        ? [...new Set([...claims.teamMemberUserIds, claims.userId])]
+        : [claims.userId];
+    return {
+      unscoped: false,
+      scopeCreatedByIds: creators,
+      scopeTeamIds: [...claims.teamIds],
+    };
+  }
+  return { unscoped: false, scopeCreatedByIds: [claims.userId], scopeTeamIds: [] };
+}
+
 function listFilter(req: Request): ReferralListFilter {
   const q = (k: string) => queryParam(req, k);
-  const f: ReferralListFilter = {
+  const access = referralAccess(claimsOf(req));
+  return {
     search: q("q"),
     ownerUserId: q("ownerUserId"),
     teamId: q("teamId"),
@@ -44,15 +81,8 @@ function listFilter(req: Request): ReferralListFilter {
     order: q("order"),
     limit: atoi(q("limit")),
     offset: atoi(q("offset")),
-    scopeOwnerIds: [],
-    scopeTeamIds: [],
-    unscoped: false,
+    ...access,
   };
-  const claims = claimsOf(req);
-  if (expandImplies(claims.permissions).has(P.ReferralsManage) || claims.roleCode === Role.SuperAdmin) {
-    return { ...f, unscoped: true };
-  }
-  return { ...f, scopeOwnerIds: [claims.userId], scopeTeamIds: [...claims.teamIds] };
 }
 
 export function referralsRouter(service: ReferralsService, guard: Guard): Router {
@@ -96,11 +126,13 @@ export function referralsRouter(service: ReferralsService, guard: Guard): Router
   });
 
   router.get("/api/v1/referrals/:id", ...guard(...view), async (req, res) => {
-    ok(res, await service.get(pathParam(req, "id")));
+    ok(res, await service.get(pathParam(req, "id"), referralAccess(claimsOf(req))));
   });
 
   router.patch("/api/v1/referrals/:id", ...guard(P.ReferralsEdit, P.ReferralsManage), jsonBody, async (req, res) => {
     const input = decodeJson(req, referralUpdateSchema);
+    // Load under view scope first so SEs cannot edit a teammate's referral by id.
+    await service.get(pathParam(req, "id"), referralAccess(claimsOf(req)));
     ok(res, await service.update(claimsOf(req).userId, pathParam(req, "id"), input, requestMeta(req)));
   });
 
