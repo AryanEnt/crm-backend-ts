@@ -98,6 +98,7 @@ const updateSchema = z.strictObject({
   reopen: z.boolean().optional(),
   forceUpdate: bool(),
   customFields: anyMap(),
+  referral: optionalObject(referralInputSchema),
 });
 
 const moveSchema = z.strictObject({

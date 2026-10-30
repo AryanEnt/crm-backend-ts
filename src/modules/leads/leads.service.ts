@@ -148,6 +148,7 @@ export interface UpdateLeadInput {
   reopen?: boolean | undefined;
   forceUpdate: boolean;
   customFields?: Record<string, unknown> | undefined;
+  referral?: ReferralInput | undefined;
 }
 
 export interface LeadListFilter {
@@ -862,6 +863,11 @@ export class LeadsService {
     if (plan) {
       await this.stages.apply(actorId, plan, meta, "crm");
       lead = await this.get(id);
+    }
+
+    const nextSource = in_.source !== undefined ? in_.source.trim() : cur.source;
+    if (isReferralSource(nextSource) && in_.referral) {
+      await this.referrals.upsertForLead(actorId, id, in_.referral, meta);
     }
 
     await this.audit.record(actorId, "lead.updated", "lead", id, { fullName: lead.fullName }, meta);

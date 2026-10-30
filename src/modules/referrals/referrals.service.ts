@@ -654,6 +654,15 @@ export class ReferralsService {
     return internal("failed to load referral", () => this.one(sql`r.customer_id = ${customerId}`));
   }
 
+  async upsertForLead(actorId: string, leadId: string, in_: ReferralInput, meta: RequestMeta): Promise<Referral> {
+    const existing = await this.getForLead(leadId);
+    if (existing) {
+      const { statusCode: _status, ...rest } = in_;
+      return this.update(actorId, existing.id, rest, meta);
+    }
+    return this.attachToLead(actorId, leadId, in_, meta);
+  }
+
   async attachToLead(actorId: string, leadId: string, in_: ReferralInput, meta: RequestMeta): Promise<Referral> {
     validateReferral(in_);
     const ref = await this.create(await this.resolveInput(in_, leadId, null, actorId));
