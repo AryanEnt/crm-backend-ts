@@ -658,7 +658,13 @@ export class ReferralsService {
     const existing = await this.getForLead(leadId);
     if (existing) {
       const { statusCode: _status, ...rest } = in_;
-      return this.update(actorId, existing.id, rest, meta);
+      // Keep current status/lead/customer; ReferralUpdate requires these keys present.
+      return this.update(actorId, existing.id, {
+        ...rest,
+        statusCode: undefined,
+        leadId: undefined,
+        customerId: undefined,
+      }, meta);
     }
     return this.attachToLead(actorId, leadId, in_, meta);
   }
