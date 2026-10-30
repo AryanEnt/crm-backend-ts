@@ -36,6 +36,7 @@ export function analyticsRouter(service: AnalyticsService, guard: Guard): Router
   router.get("/api/v1/analytics/conversions", ...view, async (req, res) => ok(res, await service.conversions(filter(req))));
   router.get("/api/v1/analytics/teams", ...view, async (req, res) => ok(res, await service.teams(filter(req))));
   router.get("/api/v1/analytics/sources", ...view, async (req, res) => ok(res, await service.sources(filter(req))));
+  router.get("/api/v1/analytics/countries", ...view, async (req, res) => ok(res, await service.countries(filter(req))));
 
   // Defaults to org-wide totals when no team/owner is chosen, so it needs organization scope.
   router.get("/api/v1/analytics/organization", ...view, async (req, res) => {

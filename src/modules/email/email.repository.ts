@@ -20,15 +20,34 @@ export interface AccountPublic {
   lastSyncAt: Date | null;
   lastSyncError: string;
   createdAt: Date;
+  ownerUserId?: string;
+  ownerName?: string;
 }
 
 export interface AccountRecord extends AccountPublic {
   userId: string;
   encryptedAccessToken: string;
   encryptedRefreshToken: string;
+  encryptedPassword: string;
   tokenExpiry: Date | null;
   gmailHistoryId: string;
   watchExpiration: Date | null;
+  imapInboxFolder: string;
+  imapSentFolder: string;
+  imapInboxUidValidity: number;
+  imapInboxUid: number;
+  imapSentUidValidity: number;
+  imapSentUid: number;
+}
+
+export interface ConnectionInvite {
+  id: string;
+  invitedUserId: string;
+  invitedBy: string;
+  emailAddress: string;
+  provider: string;
+  expiresAt: Date;
+  consumedAt: Date | null;
 }
 
 export interface Thread {
@@ -221,9 +240,15 @@ const accountSelect = sql`
   SELECT a.id::text AS "id", a.user_id::text AS "userId", a.provider, a.email_address AS "emailAddress",
     a.display_name AS "displayName", a.avatar_url AS "avatarUrl",
     a.encrypted_access_token AS "encryptedAccessToken", a.encrypted_refresh_token AS "encryptedRefreshToken",
+    COALESCE(a.encrypted_password,'') AS "encryptedPassword",
     a.token_expiry AS "tokenExpiry", a.gmail_history_id AS "gmailHistoryId", a.watch_expiration AS "watchExpiration",
     a.connection_status AS "connectionStatus", a.sending_enabled AS "sendingEnabled", a.receiving_enabled AS "receivingEnabled",
-    a.last_sync_at AS "lastSyncAt", a.last_sync_error AS "lastSyncError", a.created_at AS "createdAt"
+    a.last_sync_at AS "lastSyncAt", a.last_sync_error AS "lastSyncError", a.created_at AS "createdAt",
+    COALESCE(a.imap_inbox_folder,'') AS "imapInboxFolder", COALESCE(a.imap_sent_folder,'') AS "imapSentFolder",
+    COALESCE(a.imap_inbox_uidvalidity,0)::float8 AS "imapInboxUidValidity",
+    COALESCE(a.imap_inbox_uid,0)::float8 AS "imapInboxUid",
+    COALESCE(a.imap_sent_uidvalidity,0)::float8 AS "imapSentUidValidity",
+    COALESCE(a.imap_sent_uid,0)::float8 AS "imapSentUid"
   FROM email_accounts a`;
 
 const threadSelect = sql`
@@ -279,7 +304,11 @@ function threadScope(claims: Claims, ownerUserId: string): Predicate[] {
   const vis = resolve(claims, P.EmailView, ownerUserId);
   const where = appendScope([sql`TRUE`], vis, { owner: "t.owner_user_id" });
   const ownOnly = vis.ownerIds.length === 1 && vis.ownerIds[0] === claims.userId && vis.teamIds.length === 0 && !vis.unscoped;
-  if (!ownOnly) {
+  const assignedMailbox =
+    ownerUserId !== "" &&
+    ownerUserId !== claims.userId &&
+    (vis.unscoped || vis.ownerIds.includes(ownerUserId));
+  if (!ownOnly && !assignedMailbox) {
     where.push(sql`(t.lead_id IS NOT NULL OR t.customer_id IS NOT NULL OR t.match_status = 'needs_association')`);
   }
   return where;
@@ -328,7 +357,18 @@ export class EmailRepository {
     return r.rows[0];
   }
 
-  async upsertAccount(rec: Omit<AccountRecord, "id" | "provider" | "createdAt" | "sendingEnabled" | "receivingEnabled" | "lastSyncError" | "watchExpiration">): Promise<AccountRecord | null> {
+  async upsertAccount(rec: {
+    userId: string;
+    emailAddress: string;
+    displayName: string;
+    avatarUrl: string;
+    connectionStatus: string;
+    encryptedAccessToken: string;
+    encryptedRefreshToken: string;
+    tokenExpiry: Date | null;
+    gmailHistoryId: string;
+    lastSyncAt: Date | null;
+  }): Promise<AccountRecord | null> {
     const r = await sql<{ id: string }>`
       INSERT INTO email_accounts (
         id, user_id, provider, email_address, display_name, avatar_url,
@@ -427,6 +467,7 @@ export class EmailRepository {
         connection_status='disconnected',
         encrypted_access_token='',
         encrypted_refresh_token='',
+        encrypted_password='',
         token_expiry=NULL,
         updated_at=NOW()
       WHERE id=${id}`.execute(this.db);
@@ -435,9 +476,126 @@ export class EmailRepository {
   async listAccountsNeedingWatch(): Promise<AccountRecord[]> {
     const r = await sql<AccountRecord>`
       ${accountSelect}
-      WHERE a.connection_status IN ('connected','syncing','error')
+      WHERE a.provider='gmail' AND a.connection_status IN ('connected','syncing','error')
         AND (a.watch_expiration IS NULL OR a.watch_expiration < NOW() + INTERVAL '24 hours')`.execute(this.db);
     return r.rows;
+  }
+
+  async listImapAccountsDue(): Promise<AccountRecord[]> {
+    const r = await sql<AccountRecord>`
+      ${accountSelect}
+      WHERE a.provider='imap' AND a.connection_status IN ('connected','syncing','error')`.execute(this.db);
+    return r.rows;
+  }
+
+  async upsertImapAccount(rec: {
+    userId: string;
+    emailAddress: string;
+    displayName: string;
+    encryptedPassword: string;
+    inboxFolder: string;
+    sentFolder: string;
+  }): Promise<AccountRecord | null> {
+    const r = await sql<{ id: string }>`
+      INSERT INTO email_accounts (
+        id, user_id, provider, email_address, display_name, avatar_url,
+        encrypted_access_token, encrypted_refresh_token, encrypted_password,
+        connection_status, sending_enabled, receiving_enabled, last_sync_error,
+        imap_inbox_folder, imap_sent_folder
+      ) VALUES (
+        ${randomUUID()}, ${rec.userId}, 'imap', ${rec.emailAddress}, ${rec.displayName}, '',
+        '', '', ${rec.encryptedPassword},
+        'connected', TRUE, TRUE, '',
+        ${rec.inboxFolder}, ${rec.sentFolder}
+      )
+      ON CONFLICT (user_id, email_address) DO UPDATE SET
+        provider='imap',
+        encrypted_password=EXCLUDED.encrypted_password,
+        connection_status='connected',
+        sending_enabled=TRUE,
+        receiving_enabled=TRUE,
+        last_sync_error='',
+        imap_inbox_folder=EXCLUDED.imap_inbox_folder,
+        imap_sent_folder=EXCLUDED.imap_sent_folder,
+        updated_at=NOW()
+      RETURNING id::text AS "id"`.execute(this.db);
+    return this.getAccount(r.rows[0]!.id);
+  }
+
+  async updateImapCursor(
+    id: string,
+    folder: "inbox" | "sent",
+    uidValidity: number,
+    uid: number,
+    path: string,
+  ): Promise<void> {
+    if (folder === "inbox") {
+      await sql`
+        UPDATE email_accounts SET
+          imap_inbox_uidvalidity=${uidValidity}, imap_inbox_uid=${uid}, imap_inbox_folder=${path}, updated_at=NOW()
+        WHERE id=${id}`.execute(this.db);
+    } else {
+      await sql`
+        UPDATE email_accounts SET
+          imap_sent_uidvalidity=${uidValidity}, imap_sent_uid=${uid}, imap_sent_folder=${path}, updated_at=NOW()
+        WHERE id=${id}`.execute(this.db);
+    }
+  }
+
+  async listAssignedPeople(userIds: string[]): Promise<{ userId: string; fullName: string; email: string }[]> {
+    if (userIds.length === 0) return [];
+    const r = await sql<{ userId: string; fullName: string; email: string }>`
+      SELECT u.id::text AS "userId", u.full_name AS "fullName", COALESCE(u.email,'') AS "email"
+      FROM users u WHERE u.id = ANY(${userIds}::uuid[]) AND u.is_active = TRUE
+      ORDER BY u.full_name`.execute(this.db);
+    return r.rows;
+  }
+
+  async listAccountsForUsers(userIds: string[]): Promise<(AccountPublic & { ownerUserId: string })[]> {
+    if (userIds.length === 0) return [];
+    const r = await sql<AccountPublic & { ownerUserId: string }>`
+      SELECT a.id::text AS "id", a.provider, a.email_address AS "emailAddress", a.display_name AS "displayName",
+        a.avatar_url AS "avatarUrl", a.connection_status AS "connectionStatus", a.sending_enabled AS "sendingEnabled",
+        a.receiving_enabled AS "receivingEnabled", a.last_sync_at AS "lastSyncAt", a.last_sync_error AS "lastSyncError",
+        a.created_at AS "createdAt", a.user_id::text AS "ownerUserId"
+      FROM email_accounts a
+      WHERE a.user_id = ANY(${userIds}::uuid[]) AND a.connection_status <> 'disconnected'
+      ORDER BY a.created_at`.execute(this.db);
+    return r.rows;
+  }
+
+  async insertInvite(rec: {
+    tokenHash: string;
+    invitedUserId: string;
+    invitedBy: string;
+    emailAddress: string;
+    provider: string;
+    expiresAt: Date;
+  }): Promise<void> {
+    await sql`
+      INSERT INTO email_connection_invites (token_hash, invited_user_id, invited_by, email_address, provider, expires_at)
+      VALUES (${rec.tokenHash}, ${rec.invitedUserId}, ${rec.invitedBy}, ${rec.emailAddress}, ${rec.provider}, ${rec.expiresAt})`.execute(
+      this.db,
+    );
+  }
+
+  async consumeInvite(tokenHash: string): Promise<ConnectionInvite | null> {
+    const r = await sql<ConnectionInvite>`
+      UPDATE email_connection_invites
+      SET consumed_at=NOW()
+      WHERE token_hash=${tokenHash} AND consumed_at IS NULL AND expires_at > NOW()
+      RETURNING id::text AS "id", invited_user_id::text AS "invitedUserId", invited_by::text AS "invitedBy",
+        email_address AS "emailAddress", provider, expires_at AS "expiresAt", consumed_at AS "consumedAt"`.execute(this.db);
+    return r.rows[0] ?? null;
+  }
+
+  async peekInvite(tokenHash: string): Promise<ConnectionInvite | null> {
+    const r = await sql<ConnectionInvite>`
+      SELECT id::text AS "id", invited_user_id::text AS "invitedUserId", invited_by::text AS "invitedBy",
+        email_address AS "emailAddress", provider, expires_at AS "expiresAt", consumed_at AS "consumedAt"
+      FROM email_connection_invites
+      WHERE token_hash=${tokenHash} AND consumed_at IS NULL AND expires_at > NOW()`.execute(this.db);
+    return r.rows[0] ?? null;
   }
 
   async listScheduledDue(now: Date): Promise<Message[]> {

@@ -323,8 +323,10 @@ export interface Documents {
   mime_type: Generated<string>;
   name: string;
   notes: Generated<string>;
+  original_filename: Generated<string>;
   rejected_reason: Generated<string>;
   requested_at: Timestamp | null;
+  share_scope: Generated<string>;
   size_bytes: Generated<number>;
   status: Generated<string>;
   storage_provider: Generated<string>;
@@ -333,6 +335,15 @@ export interface Documents {
   uploaded_by: string | null;
   verified_at: Timestamp | null;
   verified_by: string | null;
+}
+
+export interface DocumentShares {
+  created_at: Generated<Timestamp>;
+  document_id: string;
+  id: Generated<string>;
+  target_type: string;
+  team_id: string | null;
+  user_id: string | null;
 }
 
 export interface DocumentViewers {
@@ -867,6 +878,19 @@ export interface WhatsappCalls {
   updated_at: Generated<Timestamp>;
 }
 
+export interface InAppNotifications {
+  body: string;
+  created_at: Generated<Timestamp>;
+  dedupe_key: string;
+  id: Generated<string>;
+  lead_id: string | null;
+  payload: Generated<Json>;
+  read_at: Timestamp | null;
+  recipient_user_id: string;
+  title: string;
+  type: string;
+}
+
 export interface DB {
   activities: Activities;
   activity_types: ActivityTypes;
@@ -886,6 +910,7 @@ export interface DB {
   deal_stage_transitions: DealStageTransitions;
   deals: Deals;
   documents: Documents;
+  document_shares: DocumentShares;
   document_viewers: DocumentViewers;
   email_accounts: EmailAccounts;
   email_attachments: EmailAttachments;
@@ -893,6 +918,7 @@ export interface DB {
   email_oauth_states: EmailOauthStates;
   email_templates: EmailTemplates;
   email_threads: EmailThreads;
+  in_app_notifications: InAppNotifications;
   lead_score_snapshots: LeadScoreSnapshots;
   lead_sources: LeadSources;
   lead_stage_transitions: LeadStageTransitions;

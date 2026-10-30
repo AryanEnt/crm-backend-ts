@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { AppError } from "../src/lib/app-error.js";
 import {
   appendScope,
+  applyListFilters,
   resolve,
   resolveReport,
   widestScope,
@@ -140,6 +141,22 @@ describe("resolveReport", () => {
     });
     const rs = resolveReport(c, P.AnalyticsView, "team-x", "u-9");
     expect(rs).toMatchObject({ teamId: "team-x", ownerUserId: "u-9", userIds: null, teamIds: null });
+  });
+});
+
+describe("applyListFilters", () => {
+  it("keeps org teamId when an owner is also set", () => {
+    const vis = { unscoped: true, ownerIds: [], teamIds: [] };
+    const out = applyListFilters(vis, "u-1", "team-9", "");
+    expect(out.teamId).toBe("team-9");
+    expect(out.scope).toEqual({ unscoped: false, ownerIds: ["u-1"], teamIds: [] });
+  });
+
+  it("team-scoped callers keep team on visibility, not as a SQL teamId filter", () => {
+    const vis = { unscoped: false, ownerIds: [], teamIds: ["team-1", "team-2"] };
+    const out = applyListFilters(vis, "", "team-2", "");
+    expect(out.teamId).toBe("");
+    expect(out.scope.teamIds).toEqual(["team-2"]);
   });
 });
 

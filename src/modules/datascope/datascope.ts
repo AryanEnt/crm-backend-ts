@@ -169,6 +169,25 @@ export function applyOwnerFilter(v: Visibility, ownerUserId: string): Visibility
   return { ...v, ownerIds: [owner] };
 }
 
+/**
+ * Client owner/team query params after resolve(). Org-wide viewers keep `teamId` as a
+ * SQL filter even when an owner is also set (All / Team / Individual).
+ */
+export function applyListFilters(
+  vis: Visibility,
+  ownerUserId: string,
+  teamId: string,
+  seId: string,
+): { scope: Visibility; teamId: string } {
+  const orgTeamFilter = vis.unscoped ? teamId : "";
+  if (seId === "" && ownerUserId !== "") vis = applyOwnerFilter(vis, ownerUserId);
+  if (teamId !== "" && !vis.unscoped && vis.teamIds.length > 0) {
+    if (!vis.teamIds.includes(teamId)) throw AppError.forbidden("team is outside your scope");
+    vis = { ...vis, teamIds: [teamId] };
+  }
+  return { scope: vis, teamId: orgTeamFilter };
+}
+
 /** Ownership columns on a CRM entity. Column names are trusted constants, never user input. */
 export interface Columns {
   /** e.g. "l.owner_user_id" */

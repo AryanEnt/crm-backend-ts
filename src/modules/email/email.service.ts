@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Database } from "../../db/database.js";
 import { AppError } from "../../lib/app-error.js";
 import { truncateBytes } from "../../lib/go-strings.js";
@@ -7,7 +7,7 @@ import type { RequestMeta } from "../../lib/request-meta.js";
 import { logger } from "../../logger.js";
 import type { AuditService } from "../audit/audit.service.js";
 import type { Claims } from "../auth/types.js";
-import { P, Role, scopeFor } from "../permissions/permissions.js";
+import { P, scopeFor } from "../permissions/permissions.js";
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
 import { decodeStdBase64, TokenBox } from "./crypto.js";
 import {
@@ -21,7 +21,11 @@ import {
   type ThreadListFilter,
 } from "./email.repository.js";
 import { collectBodies, GmailApiError, GmailClient, googleErrorLogFields, headerValue } from "./gmail.js";
+import { ImapSmtpTransport } from "./imap-smtp.js";
+import { assignedUserIds, canInviteUser, canManageMailbox, canSendFromMailbox } from "./mailbox-access.js";
+import { safeMailError, type FetchedMail, type MailTransport, type MailboxAuth } from "./mail-provider.js";
 import { applyVars, buildRfc822, findUnresolved, parseAddress, parseAddressList, parseInt64, stripTags, uniqueEmails } from "./mime.js";
+import { sanitizeEmailHtml } from "./sanitize.js";
 
 export interface EmailConfig {
   publicApiUrl: string;
@@ -31,12 +35,20 @@ export interface EmailConfig {
   gmailPubSubTopic: string;
   tokenEncryptionKey: string;
   jwtSecret: string;
+  mailImapHost?: string;
+  mailImapPort?: number;
+  mailImapSecure?: boolean;
+  mailSmtpHost?: string;
+  mailSmtpPort?: number;
+  mailSmtpSecure?: boolean;
+  mailSyncIntervalMs?: number;
 }
 
 export interface IntegrationHealth {
   configured: boolean;
   oauthConfigured: boolean;
   gmailApiEnabled: boolean;
+  imapConfigured: boolean;
   pubSubConfigured: boolean;
   pushSyncHealthy: boolean;
   connectedAccounts: number;
@@ -100,26 +112,50 @@ export interface TemplateInput {
 const NO_META: RequestMeta = { ip: "", userAgent: "" };
 const ref = (v: Ref): string | null => v ?? null;
 
+function hashInvite(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 export class EmailService {
   readonly repo: EmailRepository;
   private readonly box: TokenBox;
   private readonly gmail: GmailClient;
+  private readonly imap: MailTransport;
+  private readonly syncing = new Set<string>();
 
   constructor(
     db: Database,
     private readonly cfg: EmailConfig,
     private readonly audit: AuditService,
     private readonly timeline: TimelineService,
-    deps: { gmail?: GmailClient } = {},
+    deps: { gmail?: GmailClient; imap?: MailTransport } = {},
   ) {
     this.repo = new EmailRepository(db);
     this.box = new TokenBox(cfg.tokenEncryptionKey || cfg.jwtSecret);
     const redirect = `${cfg.publicApiUrl.replace(/\/+$/, "")}/api/v1/email/google/callback`;
     this.gmail = deps.gmail ?? new GmailClient(cfg.googleClientId, cfg.googleClientSecret, redirect);
+    this.imap =
+      deps.imap ??
+      new ImapSmtpTransport({
+        imapHost: cfg.mailImapHost ?? "",
+        imapPort: cfg.mailImapPort ?? 993,
+        imapSecure: cfg.mailImapSecure ?? true,
+        smtpHost: cfg.mailSmtpHost ?? "",
+        smtpPort: cfg.mailSmtpPort ?? 587,
+        smtpSecure: cfg.mailSmtpSecure ?? false,
+      });
   }
 
   configured(): boolean {
+    return this.gmailConfigured() || this.imapConfigured();
+  }
+
+  gmailConfigured(): boolean {
     return this.cfg.googleClientId.trim() !== "" && this.cfg.googleClientSecret.trim() !== "";
+  }
+
+  imapConfigured(): boolean {
+    return (this.cfg.mailImapHost ?? "").trim() !== "" && (this.cfg.mailSmtpHost ?? "").trim() !== "";
   }
 
   private frontSettings(): string {
@@ -129,14 +165,15 @@ export class EmailService {
   async health(): Promise<IntegrationHealth> {
     const h: IntegrationHealth = {
       configured: this.configured(),
-      oauthConfigured: this.configured(),
-      gmailApiEnabled: this.configured(),
+      oauthConfigured: this.gmailConfigured(),
+      gmailApiEnabled: this.gmailConfigured(),
+      imapConfigured: this.imapConfigured(),
       pubSubConfigured: this.cfg.gmailPubSubTopic.trim() !== "",
       pushSyncHealthy: false,
       connectedAccounts: 0,
       needsAttention: 0,
     };
-    if (!h.configured) return { ...h, message: "Gmail integration is not configured" };
+    if (!h.configured) return { ...h, message: "Email integration is not configured" };
     try {
       const c = await this.repo.healthCounts();
       h.connectedAccounts = c.connected;
@@ -153,7 +190,7 @@ export class EmailService {
   }
 
   async startConnect(claims: Claims, redirectTo: string): Promise<string> {
-    if (!this.configured()) throw AppError.validation("Gmail integration is not configured");
+    if (!this.gmailConfigured()) throw AppError.validation("Gmail integration is not configured");
     const state = randomBytes(24).toString("base64url");
     await this.repo.insertOAuthState(state, claims.userId, redirectTo || this.frontSettings(), new Date(Date.now() + 10 * 60_000));
     return this.gmail.authUrl(state);
@@ -226,20 +263,35 @@ export class EmailService {
   }
 
   async disconnect(claims: Claims, accountId: string, meta: RequestMeta): Promise<void> {
-    const acc = await this.requireOwnAccount(claims, accountId);
-    const token = await this.accessToken(acc).catch(() => "");
-    if (token !== "") await this.gmail.stopWatch(token);
+    const acc = await this.requireManageAccount(claims, accountId);
+    if (acc.provider === "gmail") {
+      const token = await this.accessToken(acc).catch(() => "");
+      if (token !== "") await this.gmail.stopWatch(token);
+    }
     await this.repo.disconnect(acc.id);
-    await this.audit.record(claims.userId, "gmail.disconnected", "email_account", acc.id, { email: acc.emailAddress }, meta);
+    await this.audit.record(claims.userId, "email.disconnected", "email_account", acc.id, { email: acc.emailAddress, provider: acc.provider }, meta);
   }
 
   private async requireOwnAccount(claims: Claims, accountId: string): Promise<AccountRecord> {
     const acc = await this.repo.getAccount(accountId);
     if (!acc || acc.connectionStatus === "disconnected") throw AppError.notFound("email account not found");
-    if (acc.userId !== claims.userId && claims.roleCode !== Role.SuperAdmin) {
-      throw AppError.forbidden("cannot manage another user's Gmail account");
+    if (!canSendFromMailbox(claims, acc)) {
+      throw AppError.forbidden("cannot send from another user's mailbox");
     }
     return acc;
+  }
+
+  private async requireManageAccount(claims: Claims, accountId: string): Promise<AccountRecord> {
+    const acc = await this.repo.getAccount(accountId);
+    if (!acc || acc.connectionStatus === "disconnected") throw AppError.notFound("email account not found");
+    if (!canManageMailbox(claims, acc)) {
+      throw AppError.forbidden("cannot manage this mailbox");
+    }
+    return acc;
+  }
+
+  private mailboxAuth(acc: AccountRecord): MailboxAuth {
+    return { user: acc.emailAddress, pass: this.box.decrypt(acc.encryptedPassword) };
   }
 
   private async accessToken(acc: AccountRecord): Promise<string> {
@@ -324,7 +376,7 @@ export class EmailService {
   }
 
   async syncAccountFor(claims: Claims, accountId: string): Promise<void> {
-    const acc = await this.requireOwnAccount(claims, accountId);
+    const acc = await this.requireManageAccount(claims, accountId);
     await this.syncAccount(acc);
   }
 
@@ -346,6 +398,10 @@ export class EmailService {
   }
 
   private async syncAccount(acc: AccountRecord): Promise<void> {
+    if (acc.provider === "imap") {
+      await this.syncImapAccount(acc);
+      return;
+    }
     await this.repo.updateSync(acc.id, "syncing", acc.gmailHistoryId, "").catch(() => undefined);
     const token = await this.accessToken(acc);
     if (acc.gmailHistoryId === "") {
@@ -387,8 +443,10 @@ export class EmailService {
     const to = parseAddressList(headerValue(headers, "To"));
     const cc = parseAddressList(headerValue(headers, "Cc"));
     const subj = headerValue(headers, "Subject");
-    const { html, attachments } = collectBodies(gm.payload);
-    let text = collectBodies(gm.payload).text;
+    const bodies = collectBodies(gm.payload);
+    const html = sanitizeEmailHtml(bodies.html);
+    const attachments = bodies.attachments;
+    let text = bodies.text;
     if (text === "") text = stripTags(html);
     const snippet = gm.snippet !== "" ? gm.snippet : truncateBytes(text, 180);
     const outbound = fromAddr.toLowerCase() === acc.emailAddress.toLowerCase();
@@ -497,9 +555,9 @@ export class EmailService {
         title: msg.direction === "outbound" ? "Email sent" : "Email received",
         body: msg.subject,
         actorUserId: actorId,
-        source: "gmail",
+        source: "email",
         externalId: msg.providerMessageId !== "" ? msg.providerMessageId : msg.id,
-        externalProvider: "gmail",
+        externalProvider: "email",
         leadId: thread.leadId,
         customerId: thread.customerId,
         dealId: thread.dealId,
@@ -587,7 +645,7 @@ export class EmailService {
   private async accountForCompose(claims: Claims, accountId: string): Promise<AccountRecord> {
     if (accountId !== "") return this.requireOwnAccount(claims, accountId);
     const acc = await this.repo.getAccountByUser(claims.userId);
-    if (!acc) throw AppError.validation("Connect your Gmail account first");
+    if (!acc) throw AppError.validation("Connect your email account first");
     if (acc.connectionStatus === "needs_reauth") throw AppError.unauthorized("Gmail connection needs attention");
     return acc;
   }
@@ -646,6 +704,9 @@ export class EmailService {
 
   private async sendMessage(actorId: string, acc: AccountRecord, thread: Thread, m: Message, meta: RequestMeta): Promise<Message | null> {
     if (m.toAddresses.length === 0) throw AppError.validation("Add at least one recipient");
+    m.fromAddress = acc.emailAddress;
+    m.fromName = acc.displayName;
+    if (acc.provider === "imap") return this.sendImap(actorId, acc, thread, m, meta);
     let token: string;
     try {
       token = await this.accessToken(acc);
@@ -748,6 +809,353 @@ export class EmailService {
     }
     for (const acc of accs) {
       await this.ensureWatch(acc).catch((err: unknown) => logger.warn({ err, account: acc.id }, "renew gmail watch failed"));
+    }
+  }
+
+  async listTeamMailboxes(claims: Claims): Promise<{
+    people: {
+      userId: string;
+      fullName: string;
+      email: string;
+      mailbox: AccountPublic | null;
+    }[];
+    overview: {
+      assigned: number;
+      connected: number;
+      disconnected: number;
+      syncFailures: number;
+    };
+  }> {
+    const ids = assignedUserIds(claims);
+    const people = await this.repo.listAssignedPeople(ids);
+    const accounts = await this.repo.listAccountsForUsers(people.map((p) => p.userId));
+    const byUser = new Map(accounts.map((a) => [a.ownerUserId, a]));
+    const rows = people.map((p) => ({
+      userId: p.userId,
+      fullName: p.fullName,
+      email: p.email,
+      mailbox: byUser.get(p.userId) ?? null,
+    }));
+    const connected = rows.filter((r) => r.mailbox && r.mailbox.connectionStatus !== "disconnected").length;
+    const syncFailures = rows.filter(
+      (r) => r.mailbox && (r.mailbox.connectionStatus === "error" || r.mailbox.connectionStatus === "needs_reauth"),
+    ).length;
+    return {
+      people: rows,
+      overview: {
+        assigned: rows.length,
+        connected,
+        disconnected: rows.length - connected,
+        syncFailures,
+      },
+    };
+  }
+
+  async createConnectionInvite(
+    claims: Claims,
+    invitedUserId: string,
+    emailAddress: string,
+    provider: string,
+  ): Promise<{ token: string; expiresAt: Date; url: string }> {
+    if (!canInviteUser(claims, invitedUserId)) {
+      throw AppError.forbidden("you can only invite assigned team members");
+    }
+    const kind = provider === "gmail" ? "gmail" : "imap";
+    const token = randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60_000);
+    await this.repo.insertInvite({
+      tokenHash: hashInvite(token),
+      invitedUserId,
+      invitedBy: claims.userId,
+      emailAddress: emailAddress.trim().toLowerCase(),
+      provider: kind,
+      expiresAt,
+    });
+    const path = kind === "gmail" ? "/settings/email" : `/settings/email?invite=${token}`;
+    const url = `${this.cfg.frontendUrl.replace(/\/+$/, "")}${path}`;
+    await this.audit.record(
+      claims.userId,
+      "email.invite_created",
+      "user",
+      invitedUserId,
+      { provider: kind },
+      NO_META,
+    );
+    return { token, expiresAt, url };
+  }
+
+  async peekInvite(claims: Claims, token: string): Promise<{ emailAddress: string; provider: string; expiresAt: Date } | null> {
+    const inv = await this.repo.peekInvite(hashInvite(token));
+    if (!inv) return null;
+    if (inv.invitedUserId !== claims.userId && claims.roleCode !== "super_admin") {
+      throw AppError.forbidden("This connection link is for a different user");
+    }
+    return { emailAddress: inv.emailAddress, provider: inv.provider, expiresAt: inv.expiresAt };
+  }
+
+  async testImapConnection(emailAddress: string, password: string): Promise<{ inbox: string; sent: string }> {
+    if (!this.imapConfigured()) throw AppError.validation("Company mail host is not configured");
+    try {
+      return await this.imap.testConnection({ user: emailAddress.trim(), pass: password });
+    } catch (err) {
+      const safe = safeMailError(err);
+      throw AppError.validation(safe.message);
+    }
+  }
+
+  async connectImap(
+    claims: Claims,
+    in_: { emailAddress: string; password: string; inviteToken?: string },
+    meta: RequestMeta,
+  ): Promise<AccountPublic> {
+    if (!this.imapConfigured()) throw AppError.validation("Company mail host is not configured");
+    let ownerId = claims.userId;
+    let hinted = in_.emailAddress.trim().toLowerCase();
+    if (in_.inviteToken) {
+      const inv = await this.repo.peekInvite(hashInvite(in_.inviteToken));
+      if (!inv) throw AppError.validation("This connection link is invalid or has expired");
+      if (inv.invitedUserId !== claims.userId) throw AppError.forbidden("This connection link is for a different user");
+      ownerId = inv.invitedUserId;
+      if (!hinted) hinted = inv.emailAddress.trim().toLowerCase();
+    }
+    if (!hinted || !hinted.includes("@")) throw AppError.validation("Enter a valid email address");
+    if (!in_.password) throw AppError.validation("Mailbox password is required");
+    let folders;
+    try {
+      folders = await this.imap.testConnection({ user: hinted, pass: in_.password });
+    } catch (err) {
+      const safe = safeMailError(err);
+      logger.warn({ code: safe.code, accountEmail: hinted }, "imap connect failed");
+      throw AppError.validation(safe.message);
+    }
+    if (in_.inviteToken) {
+      const consumed = await this.repo.consumeInvite(hashInvite(in_.inviteToken));
+      if (!consumed) throw AppError.validation("This connection link is invalid or has expired");
+    }
+    const saved = await this.repo.upsertImapAccount({
+      userId: ownerId,
+      emailAddress: hinted,
+      displayName: claims.fullName || hinted,
+      encryptedPassword: this.box.encrypt(in_.password),
+      inboxFolder: folders.inbox,
+      sentFolder: folders.sent,
+    });
+    if (!saved) throw AppError.validation("Could not save the mailbox connection");
+    await this.audit.record(claims.userId, "email.imap_connected", "email_account", saved.id, { email: hinted }, meta);
+    void this.syncImapAccount(saved).catch((err: unknown) => logger.warn({ err, account: saved.id }, "imap initial sync failed"));
+    return saved;
+  }
+
+  private async sendImap(
+    actorId: string,
+    acc: AccountRecord,
+    thread: Thread,
+    m: Message,
+    meta: RequestMeta,
+  ): Promise<Message | null> {
+    let sent;
+    try {
+      sent = await this.imap.send(this.mailboxAuth(acc), {
+        fromName: acc.displayName,
+        fromAddress: acc.emailAddress,
+        to: m.toAddresses,
+        cc: m.ccAddresses,
+        bcc: m.bccAddresses,
+        subject: m.subject,
+        html: m.bodyHtml,
+        text: m.bodyText || stripTags(m.bodyHtml),
+        inReplyTo: m.inReplyTo ?? undefined,
+      });
+    } catch (err) {
+      const safe = safeMailError(err);
+      logger.warn({ code: safe.code, account: acc.id }, "imap send failed");
+      m.status = "failed";
+      await this.repo.updateMessage(m).catch(() => undefined);
+      await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: safe.code }, meta);
+      if (safe.code === "auth") {
+        await this.repo.updateSync(acc.id, "needs_reauth", "", "Reconnect your company mailbox").catch(() => undefined);
+      }
+      throw AppError.validation(safe.message);
+    }
+    const now = new Date();
+    m.status = "sent";
+    m.sentAt = now;
+    m.providerMessageId = sent.providerMessageId;
+    m.providerThreadId = sent.providerThreadId;
+    await this.repo.updateMessage(m);
+    thread.providerThreadId = sent.providerThreadId;
+    thread.lastMessageAt = now;
+    thread.lastMessagePreview = m.snippet;
+    await this.repo.upsertThread(thread).catch(() => undefined);
+    await this.repo.refreshThreadStats(thread.id).catch(() => undefined);
+    const saved = await this.repo.getMessage(m.id).catch(() => null);
+    if (saved) await this.writeTimeline(actorId, thread, saved);
+    await this.audit.record(actorId, "email.sent", "email_message", m.id, { to: m.toAddresses }, meta);
+    return saved;
+  }
+
+  private async syncImapAccount(acc: AccountRecord): Promise<void> {
+    if (this.syncing.has(acc.id)) return;
+    this.syncing.add(acc.id);
+    try {
+      await this.repo.updateSync(acc.id, "syncing", "", "").catch(() => undefined);
+      const auth = this.mailboxAuth(acc);
+      if (!auth.pass) {
+        await this.repo.updateSync(acc.id, "needs_reauth", "", "Reconnect your company mailbox");
+        return;
+      }
+      let inbox = acc.imapInboxFolder;
+      let sent = acc.imapSentFolder;
+      if (!inbox || !sent) {
+        const folders = await this.imap.testConnection(auth);
+        inbox = inbox || folders.inbox;
+        sent = sent || folders.sent;
+      }
+      await this.syncImapFolder(acc, auth, "inbox", inbox, Number(acc.imapInboxUidValidity) || 0, Number(acc.imapInboxUid) || 0);
+      const fresh = await this.repo.getAccount(acc.id);
+      if (fresh) {
+        await this.syncImapFolder(fresh, auth, "sent", sent, Number(fresh.imapSentUidValidity) || 0, Number(fresh.imapSentUid) || 0);
+      }
+      await this.repo.updateSync(acc.id, "connected", "", sent ? "" : "Sent folder was not found. Thunderbird sent mail may not appear until it exists.");
+    } catch (err) {
+      const safe = safeMailError(err);
+      logger.warn({ code: safe.code, account: acc.id }, "imap sync failed");
+      const status = safe.code === "auth" ? "needs_reauth" : "error";
+      await this.repo.updateSync(acc.id, status, "", safe.message).catch(() => undefined);
+    } finally {
+      this.syncing.delete(acc.id);
+    }
+  }
+
+  private async syncImapFolder(
+    acc: AccountRecord,
+    auth: MailboxAuth,
+    folder: "inbox" | "sent",
+    path: string,
+    uidValidity: number,
+    uid: number,
+  ): Promise<void> {
+    if (!path) return;
+    let cursor = { uidValidity, uid };
+    for (let batch = 0; batch < 8; batch++) {
+      const fetched = await this.imap.fetchFolder(auth, folder, path, cursor);
+      for (const msg of fetched.messages) {
+        await this.ingestFetched(acc, msg).catch((err: unknown) => logger.warn({ err, id: msg.providerMessageId }, "imap ingest failed"));
+      }
+      await this.repo.updateImapCursor(acc.id, folder, fetched.cursor.uidValidity, fetched.cursor.uid, fetched.path);
+      cursor = fetched.cursor;
+      if (fetched.messages.length < 40) break;
+    }
+  }
+
+  private async ingestFetched(acc: AccountRecord, mail: FetchedMail): Promise<void> {
+    if (await this.repo.hasProviderMessage(acc.id, mail.providerMessageId)) return;
+    const fromAddr = mail.fromAddress.toLowerCase();
+    const outbound = fromAddr === acc.emailAddress.toLowerCase() || mail.folder === "sent";
+    const direction = outbound ? "outbound" : "inbound";
+    const status = outbound ? "sent" : "received";
+    const html = sanitizeEmailHtml(mail.html);
+    const text = mail.text || stripTags(html);
+    const snippet = truncateBytes(text, 180);
+    const when = mail.date;
+    let thread = await this.repo.findThreadByProvider(acc.id, mail.providerThreadId);
+    const participants = uniqueEmails([mail.fromAddress, ...mail.to, ...mail.cc]);
+    let matchStatus = "unmatched";
+    let leadId: string | null = null;
+    let customerId: string | null = null;
+    if (thread) {
+      leadId = thread.leadId;
+      customerId = thread.customerId;
+      if (thread.matchStatus === "matched") matchStatus = "matched";
+    }
+    if (matchStatus !== "matched") {
+      const hit = await this.repo.matchAddresses(participants);
+      if (hit.count === 0) {
+        matchStatus = "unmatched";
+      } else if (hit.count === 1 && (hit.leadId !== null || hit.customerId !== null)) {
+        matchStatus = "matched";
+        leadId = hit.leadId;
+        customerId = hit.customerId;
+      } else {
+        matchStatus = "needs_association";
+        if (!thread || thread.leadId === null) leadId = hit.leadId;
+        if (!thread || thread.customerId === null) customerId = hit.customerId;
+      }
+    }
+    if (!thread) {
+      thread = await this.repo.upsertThread({
+        ...blankThread(),
+        accountId: acc.id,
+        ownerUserId: acc.userId,
+        providerThreadId: mail.providerThreadId || `local-${randomUUID()}`,
+        leadId,
+        customerId,
+        participants,
+        subject: mail.subject,
+        lastMessageAt: when,
+        lastMessagePreview: snippet,
+        messageCount: 1,
+        unreadCount: direction === "inbound" ? 1 : 0,
+        matchStatus,
+      });
+    } else {
+      thread.participants = uniqueEmails([...thread.participants, ...participants]);
+      thread.lastMessageAt = when;
+      thread.lastMessagePreview = snippet;
+      thread.matchStatus = matchStatus;
+      if (leadId !== null) thread.leadId = leadId;
+      if (customerId !== null) thread.customerId = customerId;
+      if (direction === "inbound") thread.unreadCount++;
+      thread = await this.repo.upsertThread(thread);
+    }
+    if (!thread) return;
+    try {
+      const saved = await this.repo.insertMessage({
+        threadId: thread.id,
+        accountId: acc.id,
+        ownerUserId: acc.userId,
+        providerMessageId: mail.providerMessageId,
+        providerThreadId: mail.providerThreadId,
+        direction,
+        fromAddress: mail.fromAddress,
+        fromName: mail.fromName,
+        toAddresses: mail.to,
+        ccAddresses: mail.cc,
+        bccAddresses: mail.bcc,
+        subject: mail.subject,
+        bodyHtml: html,
+        bodyText: text,
+        snippet,
+        sentAt: outbound ? when : null,
+        receivedAt: outbound ? null : when,
+        scheduledAt: null,
+        status,
+        hasAttachments: false,
+        inReplyTo: null,
+      });
+      if (saved) {
+        await this.repo.refreshThreadStats(thread.id).catch(() => undefined);
+        await this.writeTimeline(acc.userId, thread, saved);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("email_messages_provider_id_unique")) return;
+      throw err;
+    }
+  }
+
+  async syncDueImapMailboxes(): Promise<void> {
+    let accs: AccountRecord[];
+    try {
+      accs = await this.repo.listImapAccountsDue();
+    } catch (err) {
+      logger.error({ err }, "list imap accounts failed");
+      return;
+    }
+    let n = 0;
+    for (const acc of accs) {
+      if (n >= 8) break;
+      n++;
+      await this.syncImapAccount(acc);
     }
   }
 

@@ -7,6 +7,7 @@ import {
   assertLeadEditable,
   LeadStageService,
   missingLeadFields,
+  parseClosingAmount,
   statusForStage,
   type MovableLead,
 } from "../src/modules/leads/lead-stage.service.js";
@@ -119,6 +120,14 @@ describe("lead stage helpers", () => {
     expect(missingLeadFields(movable({ potentialValue: 0, employer: "Acme" }), ["potential_value", "employer"], new Map())).toEqual([]);
   });
 
+  it("parseClosingAmount accepts whole non-negative amounts", () => {
+    expect(parseClosingAmount(0)).toBe(0);
+    expect(parseClosingAmount(15000)).toBe(15000);
+    expect(parseClosingAmount(undefined)).toBeNull();
+    expect(parseClosingAmount(-1)).toBeNull();
+    expect(parseClosingAmount(12.5)).toBeNull();
+  });
+
   it("statusForStage follows the outcome flags; archived leads keep their status", () => {
     expect(statusForStage(WON, movable())).toBe("won");
     expect(statusForStage(LOST, movable())).toBe("lost");
@@ -164,12 +173,28 @@ describe("LeadStageService.move", () => {
     expect(f.queries).toHaveLength(1);
   });
 
+  it("blocks Won until a closing amount is provided", async () => {
+    const { f, svc } = service();
+    f.queue([lead()]);
+    const err = await rejection(
+      svc.move(user, "lead-1", { stageId: WON.id, documentDeadline: "2030-06-15" }, META),
+    );
+    expect(err.message).toBe("Enter the closing amount before closing this deal");
+    expect(err.details).toMatchObject({ reason: "closing_amount_required", missingFields: ["closing_amount"] });
+    expect(f.queries).toHaveLength(1);
+  });
+
   it("moves to Won in one transaction: lead, transition, timeline, audit, automation event", async () => {
     const { f, svc, wake } = service();
     // Doc request + Won write; Nurturing handoff no-ops when the pipeline stub has no Nurturing id.
     f.queue([lead()], [], [], [], [], [{ id: "t1", metadata: {} }], [], [], [{ status: "won", nextActivityAt: null }]);
 
-    const out = await svc.move(user, "lead-1", { stageId: WON.id, documentDeadline: "2030-06-15" }, META);
+    const out = await svc.move(
+      user,
+      "lead-1",
+      { stageId: WON.id, documentDeadline: "2030-06-15", closingAmount: 15000 },
+      META,
+    );
 
     expect(out).toEqual({ leadId: "lead-1", changed: true, status: "won", needsNextActivity: false });
     const q = sqlOf(f);

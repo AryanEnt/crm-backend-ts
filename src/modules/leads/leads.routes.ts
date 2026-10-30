@@ -10,6 +10,7 @@ import {
   anyMap,
   bool,
   decodeJson,
+  optionalInt,
   optionalNumber,
   optionalObject,
   optionalString,
@@ -21,7 +22,7 @@ import { nextActivitySchema } from "../activities/activities.routes.js";
 import { claimsOf } from "../auth/auth.middleware.js";
 import { inScope, type Guard } from "../auth/guard.js";
 import type { Claims } from "../auth/types.js";
-import { applyOwnerFilter, effectiveScope, resolve, type Visibility } from "../datascope/datascope.js";
+import { applyListFilters, resolve } from "../datascope/datascope.js";
 import { Records, requireRecords } from "../datascope/record.js";
 import { P, Role } from "../permissions/permissions.js";
 import { referralInputSchema } from "../referrals/referrals.service.js";
@@ -106,6 +107,7 @@ const moveSchema = z.strictObject({
   reopen: bool(),
   lostReason: str(),
   documentDeadline: optionalString(),
+  closingAmount: optionalInt(),
   nextActivity: optionalObject(nextActivitySchema),
 });
 
@@ -131,14 +133,8 @@ function sendWriteResult(res: Parameters<typeof ok>[0], result: LeadWriteResult,
 }
 
 /** Authorization narrowing for the list; client teamId/ownerUserId only narrow within scope. */
-function listScope(claims: Claims, ownerUserId: string, teamId: string, seId: string): { scope: Visibility; teamId: string } {
-  let vis = resolve(claims, P.LeadsView, seId);
-  if (seId === "" && ownerUserId !== "") vis = applyOwnerFilter(vis, ownerUserId);
-  if (teamId !== "" && !vis.unscoped && vis.teamIds.length > 0) {
-    if (!vis.teamIds.includes(teamId)) throw AppError.forbidden("team is outside your scope");
-    vis = { ...vis, teamIds: [teamId] };
-  }
-  return { scope: vis, teamId: vis.unscoped ? teamId : "" };
+function listScope(claims: Claims, ownerUserId: string, teamId: string, seId: string) {
+  return applyListFilters(resolve(claims, P.LeadsView, seId), ownerUserId, teamId, seId);
 }
 
 function listFilter(req: Request): LeadListFilter {
@@ -156,6 +152,7 @@ function listFilter(req: Request): LeadListFilter {
     priority: q("priority"),
     anzscoId: q("anzscoId"),
     tag: q("tag"),
+    country: q("country"),
     createdFrom: q("createdFrom"),
     createdTo: q("createdTo"),
     closedFrom: instantParam(q, "closedFrom"),
@@ -214,6 +211,7 @@ function boardFilter(req: Request): BoardFilter {
     priority: q("priority"),
     source: q("source"),
     tag: q("tag"),
+    country: q("country"),
     activity: q("activity"),
     ...valueRange(q),
     scope,
@@ -236,6 +234,11 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
       data: items,
       meta: { total, limit: f.limit, offset: f.offset },
     });
+  });
+
+  /** Distinct countries (+ counts) for the leads filter dropdown; respects scope and other filters. */
+  router.get("/api/v1/leads/countries", ...guard(P.LeadsView), async (req, res) => {
+    ok(res, await service.listCountries(listFilter(req)));
   });
 
   router.post("/api/v1/leads", ...guard(P.LeadsCreate), jsonBody, async (req, res) => {

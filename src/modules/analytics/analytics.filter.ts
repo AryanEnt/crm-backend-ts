@@ -12,6 +12,10 @@ export interface AnalyticsFilter {
   ownerUserId: string;
   source: string;
   anzscoId: string;
+  /** Exact lead.country match; "(Unknown)" means blank country. */
+  country: string;
+  /** Optional pipeline stage filter. */
+  stageId: string;
   /** team | user | period | pipeline */
   groupBy: string;
   /** day | week | month */
@@ -25,6 +29,7 @@ export interface AnalyticsFilter {
 
 export const FILTER_KEYS = [
   "from", "to", "pipelineId", "teamId", "ownerUserId", "source", "anzscoId",
+  "country", "stageId",
   "groupBy", "period", "sortBy", "sortDir",
 ] as const;
 
@@ -48,6 +53,8 @@ export function parseFilter(q: Record<string, string>, now = new Date()): Analyt
     ownerUserId: get("ownerUserId"),
     source: get("source"),
     anzscoId: get("anzscoId"),
+    country: get("country"),
+    stageId: get("stageId"),
     groupBy: get("groupBy") || "user",
     period: get("period") || "month",
     sortBy: get("sortBy"),
@@ -113,13 +120,22 @@ export class Where {
 
   /** Go applyCommonLead. */
   commonLead(alias: string, f: AnalyticsFilter): this {
-    return this.inRange(`${alias}.created_at`, f)
+    this.inRange(`${alias}.created_at`, f)
       .eq(`${alias}.is_archived`, false)
       .eqText(`${alias}.pipeline_id`, f.pipelineId)
       .eqText(`${alias}.team_id`, f.teamId)
       .eqText(`${alias}.owner_user_id`, f.ownerUserId)
       .eq2(`${alias}.source`, f.source)
-      .eqText(`${alias}.anzsco_id`, f.anzscoId);
+      .eqText(`${alias}.anzsco_id`, f.anzscoId)
+      .eqText(`${alias}.stage_id`, f.stageId);
+    if (f.country !== "") {
+      if (f.country === "(Unknown)" || f.country === "(none)") {
+        this.add(sql`TRIM(${sql.raw(`${alias}.country`)}) = ''`);
+      } else {
+        this.eq2(`${alias}.country`, f.country);
+      }
+    }
+    return this;
   }
 
   /** Deal team/owner/source/anzsco filters; anzsco needs customers joined as "c". */

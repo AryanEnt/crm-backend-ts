@@ -68,6 +68,8 @@ import { settingsRouter } from "./modules/settings/settings.routes.js";
 import { SettingsService } from "./modules/settings/settings.service.js";
 import { systemActivityRouter } from "./modules/system-activity/system-activity.routes.js";
 import { SystemActivityService } from "./modules/system-activity/system-activity.service.js";
+import { notificationsRouter } from "./modules/notifications/notifications.routes.js";
+import { NotificationsService } from "./modules/notifications/notifications.service.js";
 
 export interface AppDeps {
   config: Config;
@@ -99,6 +101,7 @@ export function createApp({ config, db, store = createStore(config.storageDriver
   app.use(systemActivityRouter(systemActivity, guard));
   app.use(leadSourcesRouter(new LeadSourcesService(db, audit), guard));
   app.use(settingsRouter(new SettingsService(db, audit), guard));
+  app.use(notificationsRouter(new NotificationsService(db), guard));
   app.use(anzscoRouter(new AnzscoService(db), guard));
   const customFields = new CustomFieldsService(db, audit);
   const timeline = new TimelineService(db);

@@ -103,6 +103,67 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
     ok(res, { accounts: items.map(accountJson), integration });
   });
 
+  router.get("/api/v1/email/team/mailboxes", ...guard(P.EmailView, P.EmailManage), async (req, res) => {
+    const data = await service.listTeamMailboxes(claimsOf(req));
+    ok(res, {
+      overview: data.overview,
+      people: data.people.map((p) => ({
+        userId: p.userId,
+        fullName: p.fullName,
+        email: p.email,
+        mailbox: p.mailbox ? accountJson(p.mailbox) : null,
+      })),
+    });
+  });
+
+  const inviteSchema = z.strictObject({
+    invitedUserId: str(),
+    emailAddress: optionalString(),
+    provider: optionalString(),
+  });
+
+  router.post("/api/v1/email/invites", ...guard(P.EmailManage, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, inviteSchema);
+    const createdInvite = await service.createConnectionInvite(
+      claimsOf(req),
+      in_.invitedUserId,
+      in_.emailAddress ?? "",
+      in_.provider ?? "imap",
+    );
+    created(res, { url: createdInvite.url, expiresAt: createdInvite.expiresAt });
+  });
+
+  router.get("/api/v1/email/invites/:token", ...guard(P.EmailSend, P.EmailView), async (req, res) => {
+    const inv = await service.peekInvite(claimsOf(req), pathParam(req, "token"));
+    if (!inv) {
+      ok(res, { invite: null });
+      return;
+    }
+    ok(res, { invite: inv });
+  });
+
+  const imapConnectSchema = z.strictObject({
+    emailAddress: str(),
+    password: str(),
+    inviteToken: optionalString(),
+  });
+
+  router.post("/api/v1/email/imap/test", ...guard(P.EmailSend, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, imapConnectSchema);
+    const folders = await service.testImapConnection(in_.emailAddress, in_.password);
+    ok(res, { ok: true, inbox: folders.inbox, sent: folders.sent || null });
+  });
+
+  router.post("/api/v1/email/imap/connect", ...guard(P.EmailSend, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, imapConnectSchema);
+    const acc = await service.connectImap(
+      claimsOf(req),
+      { emailAddress: in_.emailAddress, password: in_.password, inviteToken: in_.inviteToken },
+      requestMetaFirstHopWithPort(req),
+    );
+    created(res, accountJson(acc));
+  });
+
   router.post("/api/v1/email/google/connect", ...guard(P.EmailSend, P.EmailView), async (req, res) => {
     const redirectTo = await lenientRedirectTo(req);
     ok(res, { url: await service.startConnect(claimsOf(req), redirectTo) });

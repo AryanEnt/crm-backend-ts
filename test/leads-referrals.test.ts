@@ -20,6 +20,7 @@ const leadFilter = (sort: string): LeadListFilter => ({
   priority: "",
   anzscoId: "",
   tag: "",
+  country: "",
   createdFrom: "",
   createdTo: "",
   inactiveDays: 0,

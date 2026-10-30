@@ -240,7 +240,8 @@ describe("email worker", () => {
       let release!: () => void;
       const renewWatches = vi.fn(() => new Promise<void>((r) => (release = r)));
       const sendDueScheduled = vi.fn(async () => undefined);
-      const worker = createEmailWorker({ renewWatches, sendDueScheduled } as unknown as EmailService);
+      const syncDueImapMailboxes = vi.fn(async () => undefined);
+      const worker = createEmailWorker({ renewWatches, sendDueScheduled, syncDueImapMailboxes } as unknown as EmailService);
       worker.start();
       await vi.advanceTimersByTimeAsync(5 * 30_000);
       expect(renewWatches).toHaveBeenCalledTimes(1);
@@ -389,17 +390,22 @@ describe("communications and email routes", () => {
   it("health reports the unconfigured integration", async () => {
     const f = fakeDb();
     queueAuth(f, "email:view");
-    const res = await request(createApp({ config: config(), db: f.db })).get("/api/v1/email/health").set("Authorization", bearer());
+    const res = await request(
+      createApp({ config: config({ mailImapHost: "", mailSmtpHost: "" }), db: f.db }),
+    )
+      .get("/api/v1/email/health")
+      .set("Authorization", bearer());
     expect(res.status).toBe(200);
     expect(res.body.data).toEqual({
       configured: false,
       oauthConfigured: false,
       gmailApiEnabled: false,
+      imapConfigured: false,
       pubSubConfigured: false,
       pushSyncHealthy: false,
       connectedAccounts: 0,
       needsAttention: 0,
-      message: "Gmail integration is not configured",
+      message: "Email integration is not configured",
     });
   });
 });

@@ -8,6 +8,7 @@ import { AuditService } from "./modules/audit/audit.service.js";
 import { createAutomationWorker } from "./modules/automation/automation.worker.js";
 import { createEmailWorker } from "./modules/email/email.worker.js";
 import { EmailService } from "./modules/email/email.service.js";
+import { createSlaNotificationWorker } from "./modules/notifications/sla.worker.js";
 import { TimelineService } from "./modules/timeline/timeline.service.js";
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -47,8 +48,9 @@ async function main(): Promise<void> {
 
   const worker = config.automationWorker ? createAutomationWorker(db) : null;
   const emailWorker = config.emailWorker
-    ? createEmailWorker(new EmailService(db, config, new AuditService(db), new TimelineService(db)))
+    ? createEmailWorker(new EmailService(db, config, new AuditService(db), new TimelineService(db)), config.mailSyncIntervalMs)
     : null;
+  const slaWorker = createSlaNotificationWorker(db);
   const app = createApp({ config, db, automationWake: worker?.wake });
   const server = app.listen(config.port, () => {
     logger.info(
@@ -65,6 +67,7 @@ async function main(): Promise<void> {
   });
   worker?.start();
   emailWorker?.start();
+  slaWorker.start();
   server.headersTimeout = 5_000 + 1_000;
   server.requestTimeout = 30_000;
   server.keepAliveTimeout = 60_000;
@@ -82,6 +85,7 @@ async function main(): Promise<void> {
     server.close(async () => {
       await worker?.stop();
       await emailWorker?.stop();
+      await slaWorker.stop();
       await db.destroy().catch(() => undefined);
       logger.info("server stopped cleanly");
       process.exit(0);

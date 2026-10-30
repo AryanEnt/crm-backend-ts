@@ -117,5 +117,10 @@ export function pipelinesRouter(service: PipelinesService, guard: Guard): Router
     ok(res, await service.updateStage(claimsOf(req).userId, pathParam(req, "id"), input, requestMeta(req)));
   });
 
+  router.delete("/api/v1/pipeline-stages/:id", ...guard(P.PipelinesManage), async (req, res) => {
+    await service.deleteStage(claimsOf(req).userId, pathParam(req, "id"), requestMeta(req));
+    ok(res, { deleted: true });
+  });
+
   return router;
 }

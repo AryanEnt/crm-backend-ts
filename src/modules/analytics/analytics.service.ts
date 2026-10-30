@@ -1,7 +1,7 @@
 import { sql } from "kysely";
 import type { Database } from "../../db/database.js";
 import { AppError } from "../../lib/app-error.js";
-import type { GoTime } from "../../lib/go-time.js";
+import { GoTime } from "../../lib/go-time.js";
 import { internal } from "../../lib/request-meta.js";
 import {
   div,
@@ -852,6 +852,140 @@ export class AnalyticsRepository {
   organization(f: AnalyticsFilter): Promise<OrganizationAnalytics> {
     return organization(this.db, f);
   }
+
+  /**
+   * Lead population by residence country (`leads.country`).
+   * Stage buckets follow the active Lead Pipeline names (Lead ≈ New).
+   * Conversion rate = won / (won + lost), matching Sales Funnel win rate.
+   */
+  async countryPopulation(f: AnalyticsFilter, opts: { includePrevious?: boolean } = {}): Promise<CountryPopulationAnalytics> {
+    const where = new Where().commonLead("l", f);
+    const { rows } = await sql<{
+      country: string;
+      total: number;
+      newCount: number;
+      contacted: number;
+      qualified: number;
+      unqualified: number;
+      won: number;
+      lost: number;
+    }>`
+      SELECT
+        COALESCE(NULLIF(TRIM(l.country), ''), '(Unknown)') AS country,
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(ps.name, '')) IN ('lead', 'new', 'created', 'cold lead')
+        )::int AS "newCount",
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(ps.name, '')) = 'contacted')::int AS contacted,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(ps.name, '')) = 'qualified')::int AS qualified,
+        COUNT(*) FILTER (
+          WHERE ps.is_lost = TRUE OR LOWER(COALESCE(ps.name, '')) IN ('lost', 'unqualified')
+        )::int AS unqualified,
+        COUNT(*) FILTER (
+          WHERE ps.is_won = TRUE OR LOWER(COALESCE(ps.name, '')) = 'won'
+        )::int AS won,
+        COUNT(*) FILTER (
+          WHERE ps.is_lost = TRUE OR LOWER(COALESCE(ps.name, '')) IN ('lost', 'unqualified')
+        )::int AS lost
+      FROM leads l
+      LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+      WHERE ${where.sql}
+      GROUP BY 1
+      ORDER BY COUNT(*) DESC, 1 ASC`.execute(this.db);
+
+    const countriesRaw = rows.map((r) => ({
+      country: r.country,
+      totalLeads: Number(r.total),
+      newLeads: Number(r.newCount),
+      contactedLeads: Number(r.contacted),
+      qualifiedLeads: Number(r.qualified),
+      unqualifiedLeads: Number(r.unqualified),
+      wonLeads: Number(r.won),
+      lostLeads: Number(r.lost),
+    }));
+    const totalLeads = countriesRaw.reduce((s, c) => s + c.totalLeads, 0);
+    const newLeads = countriesRaw.reduce((s, c) => s + c.newLeads, 0);
+    const qualifiedLeads = countriesRaw.reduce((s, c) => s + c.qualifiedLeads, 0);
+    const wonLeads = countriesRaw.reduce((s, c) => s + c.wonLeads, 0);
+    const lostLeads = countriesRaw.reduce((s, c) => s + c.lostLeads, 0);
+    const closed = wonLeads + lostLeads;
+
+    const countries: CountryPopulationRow[] = countriesRaw.map((c) => {
+      const closedCountry = c.wonLeads + c.lostLeads;
+      return {
+        ...c,
+        sharePct: round2(pct(c.totalLeads, totalLeads)),
+        conversionRate: round2(pct(c.wonLeads, closedCountry)),
+      };
+    });
+
+    const kpis: CountryPopulationKpis = {
+      totalLeads,
+      newLeads,
+      qualifiedLeads,
+      conversionRate: round2(pct(wonLeads, closed)),
+      wonLeads,
+      lostLeads,
+    };
+
+    let previousKpis: CountryPopulationKpis | null = null;
+    if (opts.includePrevious !== false) {
+      const durationMs = f.to.ms - f.from.ms;
+      if (durationMs > 0) {
+        const prevTo = new Date(f.from.ms - 1);
+        const prevFrom = new Date(prevTo.getTime() - durationMs);
+        const prev = await this.countryPopulation(
+          { ...f, from: GoTime.fromDate(prevFrom), to: GoTime.fromDate(prevTo) },
+          { includePrevious: false },
+        );
+        previousKpis = prev.kpis;
+      }
+    }
+
+    return {
+      countries,
+      kpis,
+      previousKpis,
+      from: f.from,
+      to: f.to,
+      question: "How are leads distributed across countries, and which markets convert?",
+      countryField: "country",
+      countryFieldLabel: "Lead country (residence / location)",
+    };
+  }
+}
+
+export interface CountryPopulationRow {
+  country: string;
+  totalLeads: number;
+  newLeads: number;
+  contactedLeads: number;
+  qualifiedLeads: number;
+  unqualifiedLeads: number;
+  wonLeads: number;
+  lostLeads: number;
+  sharePct: number;
+  conversionRate: number;
+}
+
+export interface CountryPopulationKpis {
+  totalLeads: number;
+  newLeads: number;
+  qualifiedLeads: number;
+  conversionRate: number;
+  wonLeads: number;
+  lostLeads: number;
+}
+
+export interface CountryPopulationAnalytics {
+  countries: CountryPopulationRow[];
+  kpis: CountryPopulationKpis;
+  previousKpis: CountryPopulationKpis | null;
+  from: GoTime;
+  to: GoTime;
+  question: string;
+  countryField: string;
+  countryFieldLabel: string;
 }
 
 const TEAM_SORT_COLUMNS: Record<string, string> = {
@@ -930,5 +1064,9 @@ export class AnalyticsService {
 
   organization(f: AnalyticsFilter): Promise<OrganizationAnalytics> {
     return internal("failed to load organization analytics", () => this.repo.organization(f));
+  }
+
+  countries(f: AnalyticsFilter): Promise<CountryPopulationAnalytics> {
+    return internal("failed to load country population analytics", () => this.repo.countryPopulation(f));
   }
 }

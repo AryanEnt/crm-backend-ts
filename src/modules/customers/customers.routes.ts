@@ -20,7 +20,7 @@ import { jsonBody } from "../../middleware/errors.js";
 import { claimsOf } from "../auth/auth.middleware.js";
 import { inScope, type Guard } from "../auth/guard.js";
 import type { Claims } from "../auth/types.js";
-import { applyOwnerFilter, resolve, type Visibility } from "../datascope/datascope.js";
+import { applyListFilters, resolve } from "../datascope/datascope.js";
 import { Records } from "../datascope/record.js";
 import { P, Role } from "../permissions/permissions.js";
 import { referralInputSchema } from "../referrals/referrals.service.js";
@@ -100,14 +100,8 @@ function sendWriteResult(res: Response, result: CustomerWriteResult, successStat
   else ok(res, result.customer);
 }
 
-function listScope(claims: Claims, ownerUserId: string, teamId: string, seId: string): { scope: Visibility; teamId: string } {
-  let vis = resolve(claims, P.CustomersView, seId);
-  if (seId === "" && ownerUserId !== "") vis = applyOwnerFilter(vis, ownerUserId);
-  if (teamId !== "" && !vis.unscoped && vis.teamIds.length > 0) {
-    if (!vis.teamIds.includes(teamId)) throw AppError.forbidden("team is outside your scope");
-    vis = { ...vis, teamIds: [teamId] };
-  }
-  return { scope: vis, teamId: vis.unscoped ? teamId : "" };
+function listScope(claims: Claims, ownerUserId: string, teamId: string, seId: string) {
+  return applyListFilters(resolve(claims, P.CustomersView, seId), ownerUserId, teamId, seId);
 }
 
 function listFilter(req: Request): CustomerListFilter {

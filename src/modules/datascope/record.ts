@@ -31,14 +31,56 @@ export interface RecordSpec {
  * Document visibility:
  * - Linked to a lead/customer/deal the caller can already see (so lead Files works), or
  * - Uploaded by the caller, or
- * - Explicitly shared via document_viewers (library / unlinked files).
+ * - Explicitly shared via document_viewers (legacy), or
+ * - Team-aware share_scope / document_shares (resolved against current membership).
  */
 function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predicate[] {
-  const shared = sql`EXISTS (
+  const sharedLegacy = sql`EXISTS (
     SELECT 1 FROM document_viewers dv
     WHERE dv.document_id = d.id AND dv.user_id = ${claims.userId}::uuid
   )`;
   const uploaded = sql`d.uploaded_by = ${claims.userId}::uuid`;
+  const allTeams = sql`(
+    d.share_scope = 'all_teams'
+    AND EXISTS (
+      SELECT 1
+      FROM team_members tm
+      JOIN users u ON u.id = tm.user_id
+      JOIN roles r ON r.id = u.role_id
+      WHERE tm.user_id = ${claims.userId}::uuid
+        AND u.is_active = TRUE
+        AND r.code IN ('sales_manager', 'sales_executive')
+    )
+  )`;
+  const teamShare = sql`EXISTS (
+    SELECT 1
+    FROM document_shares ds
+    JOIN team_members tm ON tm.team_id = ds.team_id
+    JOIN users u ON u.id = tm.user_id
+    JOIN roles r ON r.id = u.role_id
+    WHERE ds.document_id = d.id
+      AND ds.target_type = 'team'
+      AND tm.user_id = ${claims.userId}::uuid
+      AND u.is_active = TRUE
+      AND r.code IN ('sales_manager', 'sales_executive')
+  )`;
+  // selected_ses: still require co-membership with the uploader so team moves revoke access.
+  const userShare = sql`EXISTS (
+    SELECT 1 FROM document_shares ds
+    WHERE ds.document_id = d.id
+      AND ds.target_type = 'user'
+      AND ds.user_id = ${claims.userId}::uuid
+      AND (
+        d.share_scope IS DISTINCT FROM 'selected_ses'
+        OR EXISTS (
+          SELECT 1
+          FROM team_members se_tm
+          JOIN team_members tl_tm ON tl_tm.team_id = se_tm.team_id
+          WHERE se_tm.user_id = ${claims.userId}::uuid
+            AND tl_tm.user_id = d.uploaded_by
+        )
+      )
+  )`;
 
   const parents = [
     { column: "d.lead_id", from: "leads pl", alias: "pl" },
@@ -52,7 +94,7 @@ function documentWhere(where: Predicate[], v: Visibility, claims: Claims): Predi
     });
     return sql`EXISTS (SELECT 1 FROM ${sql.raw(p.from)} WHERE ${and(sub)})`;
   });
-  via.push(uploaded, shared);
+  via.push(uploaded, sharedLegacy, allTeams, teamShare, userShare);
   return [...where, sql`(${sql.join(via, sql` OR `)})`];
 }
 

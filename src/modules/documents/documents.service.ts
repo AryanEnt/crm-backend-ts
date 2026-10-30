@@ -25,7 +25,24 @@ export const DocumentStatus = {
   Expired: "expired",
 } as const;
 
+export const ShareScope = {
+  AllTeams: "all_teams",
+  SelectedTeams: "selected_teams",
+  AllTeamSes: "all_team_ses",
+  SelectedSes: "selected_ses",
+  None: "none",
+} as const;
+
+export type ShareScopeCode = (typeof ShareScope)[keyof typeof ShareScope];
+
 const VALID_STATUSES = new Set<string>(Object.values(DocumentStatus));
+const VALID_SHARE_SCOPES = new Set<string>(Object.values(ShareScope));
+
+export interface DocumentSharePlan {
+  shareScope: ShareScopeCode;
+  teamIds: string[];
+  userIds: string[];
+}
 
 /** Go documents.Document, in struct field order. */
 export interface DocumentRecord {
@@ -39,6 +56,9 @@ export interface DocumentRecord {
   fileKey: string;
   storageProvider: string;
   notes: string;
+  description: string;
+  originalFilename: string;
+  shareScope: ShareScopeCode | string;
   rejectedReason: string;
   leadId: string | null;
   leadName: string | null;
@@ -48,6 +68,7 @@ export interface DocumentRecord {
   dealTitle: string | null;
   uploadedBy: string | null;
   uploadedByName: string | null;
+  uploadedByRole: string | null;
   verifiedBy: string | null;
   verifiedByName: string | null;
   requestedDate: Date | null;
@@ -56,7 +77,11 @@ export interface DocumentRecord {
   verifiedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  /** Selected SE user IDs (and legacy viewers). */
   viewerUserIds: string[];
+  sharedUserIds: string[];
+  sharedTeamIds: string[];
+  sharedTeamNames: string[];
 }
 
 export interface DocumentListFilter {
@@ -66,6 +91,12 @@ export interface DocumentListFilter {
   status: string;
   type: string;
   q: string;
+  uploadedBy: string;
+  uploadedByRole: string;
+  shareScope: string;
+  teamId: string;
+  createdFrom: string;
+  createdTo: string;
   /** When true, hide lead screenshots from the Documents library list. */
   excludeScreenshots: boolean;
   limit: number;
@@ -74,7 +105,13 @@ export interface DocumentListFilter {
   viewer: Claims;
 }
 
-export interface RequestDocumentInput {
+export interface ShareInput {
+  shareScope: string | undefined;
+  teamIds: string[] | undefined;
+  viewerUserIds: string[] | undefined;
+}
+
+export interface RequestDocumentInput extends ShareInput {
   name: string;
   type: string;
   category: string;
@@ -84,20 +121,18 @@ export interface RequestDocumentInput {
   expiryDate: string | undefined;
   notes: string;
   status: string;
-  viewerUserIds: string[] | undefined;
 }
 
-export interface UpdateDocumentInput {
+export interface UpdateDocumentInput extends ShareInput {
   name: string | undefined;
   type: string | undefined;
   category: string | undefined;
   expiryDate: string | undefined;
   notes: string | undefined;
   status: string | undefined;
-  viewerUserIds: string[] | undefined;
 }
 
-export interface NewUpload {
+export interface NewUpload extends ShareInput {
   name: string;
   type: string;
   category: string;
@@ -106,7 +141,7 @@ export interface NewUpload {
   dealId: string | undefined;
   expiryDate: string | undefined;
   notes: string;
-  viewerUserIds: string[] | undefined;
+  originalFilename?: string;
 }
 
 export interface FileUpload {
@@ -118,25 +153,69 @@ export interface FileUpload {
 const docSelect = sql`
   SELECT d.id::text AS "id", d.name, d.doc_type AS "type", d.category, d.status, d.mime_type AS "mimeType",
     d.size_bytes AS "sizeBytes", d.file_key AS "fileKey", d.storage_provider AS "storageProvider", d.notes,
+    d.notes AS "description", d.original_filename AS "originalFilename", d.share_scope AS "shareScope",
     d.rejected_reason AS "rejectedReason",
     d.lead_id::text AS "leadId", lead.full_name AS "leadName", d.customer_id::text AS "customerId", c.full_name AS "customerName",
     d.deal_id::text AS "dealId", deal.title AS "dealTitle",
-    d.uploaded_by::text AS "uploadedBy", ub.full_name AS "uploadedByName",
+    d.uploaded_by::text AS "uploadedBy", ub.full_name AS "uploadedByName", ubr.code AS "uploadedByRole",
     d.verified_by::text AS "verifiedBy", vb.full_name AS "verifiedByName",
     d.requested_at AS "requestedDate", d.uploaded_at AS "uploadedDate", d.expires_at AS "expiryDate",
     d.verified_at AS "verifiedAt", d.created_at AS "createdAt", d.updated_at AS "updatedAt",
     COALESCE((
-      SELECT array_agg(dv.user_id::text ORDER BY dv.user_id)
-      FROM document_viewers dv WHERE dv.document_id = d.id
-    ), '{}'::text[]) AS "viewerUserIds"
+      SELECT array_agg(x ORDER BY x)
+      FROM (
+        SELECT ds.user_id::text AS x FROM document_shares ds
+        WHERE ds.document_id = d.id AND ds.target_type = 'user' AND ds.user_id IS NOT NULL
+        UNION
+        SELECT dv.user_id::text AS x FROM document_viewers dv WHERE dv.document_id = d.id
+      ) u
+    ), '{}'::text[]) AS "viewerUserIds",
+    COALESCE((
+      SELECT array_agg(ds.user_id::text ORDER BY ds.user_id)
+      FROM document_shares ds
+      WHERE ds.document_id = d.id AND ds.target_type = 'user' AND ds.user_id IS NOT NULL
+    ), '{}'::text[]) AS "sharedUserIds",
+    COALESCE((
+      SELECT array_agg(ds.team_id::text ORDER BY ds.team_id)
+      FROM document_shares ds
+      WHERE ds.document_id = d.id AND ds.target_type = 'team' AND ds.team_id IS NOT NULL
+    ), '{}'::text[]) AS "sharedTeamIds",
+    COALESCE((
+      SELECT array_agg(t.name ORDER BY t.name)
+      FROM document_shares ds
+      JOIN teams t ON t.id = ds.team_id
+      WHERE ds.document_id = d.id AND ds.target_type = 'team'
+    ), '{}'::text[]) AS "sharedTeamNames"
   FROM documents d
   LEFT JOIN leads lead ON lead.id = d.lead_id
   LEFT JOIN customers c ON c.id = d.customer_id
   LEFT JOIN deals deal ON deal.id = d.deal_id
   LEFT JOIN users ub ON ub.id = d.uploaded_by
+  LEFT JOIN roles ubr ON ubr.id = ub.role_id
   LEFT JOIN users vb ON vb.id = d.verified_by`;
 
 const blankToNull = (v: string | undefined | null): string | null => (v === undefined || v === null || v.trim() === "" ? null : v);
+
+function asTextArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.map(String) : [];
+}
+
+function normalizeDoc(row: DocumentRecord): DocumentRecord {
+  const viewerUserIds = asTextArray(row.viewerUserIds);
+  const sharedUserIds = asTextArray(row.sharedUserIds);
+  const sharedTeamIds = asTextArray(row.sharedTeamIds);
+  const sharedTeamNames = asTextArray(row.sharedTeamNames);
+  return {
+    ...row,
+    description: row.description ?? row.notes ?? "",
+    originalFilename: row.originalFilename ?? "",
+    shareScope: row.shareScope || ShareScope.None,
+    viewerUserIds,
+    sharedUserIds: sharedUserIds.length > 0 ? sharedUserIds : viewerUserIds,
+    sharedTeamIds,
+    sharedTeamNames,
+  };
+}
 
 function parseExpiry(v: string | undefined): Date | null {
   try {
@@ -172,7 +251,7 @@ export class DocumentsRepository {
     const r = await sql<DocumentRecord>`${docSelect} WHERE d.id = ${id}`.execute(this.db);
     const row = r.rows[0];
     if (!row) return null;
-    return { ...row, viewerUserIds: Array.isArray(row.viewerUserIds) ? row.viewerUserIds : [] };
+    return normalizeDoc(row);
   }
 
   async list(f: DocumentListFilter): Promise<{ items: DocumentRecord[]; total: number }> {
@@ -183,12 +262,53 @@ export class DocumentsRepository {
     if (f.leadId !== "") where.push(sql`d.lead_id::text = ${f.leadId}`);
     if (f.status !== "") where.push(sql`d.status = ${f.status}`);
     if (f.type !== "") where.push(sql`d.doc_type = ${f.type}`);
+    if (f.shareScope !== "") where.push(sql`d.share_scope = ${f.shareScope}`);
     if (f.excludeScreenshots) {
       where.push(sql`lower(d.doc_type) <> 'screenshot' AND lower(d.category) <> 'screenshot'`);
     }
     if (f.q !== "") {
       const like = `%${f.q.toLowerCase()}%`;
-      where.push(sql`(lower(d.name) LIKE ${like} OR lower(d.doc_type) LIKE ${like})`);
+      where.push(sql`(
+        lower(d.name) LIKE ${like}
+        OR lower(d.doc_type) LIKE ${like}
+        OR lower(d.original_filename) LIKE ${like}
+      )`);
+    }
+    if (f.uploadedBy !== "") where.push(sql`d.uploaded_by::text = ${f.uploadedBy}`);
+    if (f.uploadedByRole !== "") {
+      where.push(sql`EXISTS (
+        SELECT 1 FROM users ubf
+        JOIN roles ubfr ON ubfr.id = ubf.role_id
+        WHERE ubf.id = d.uploaded_by AND ubfr.code = ${f.uploadedByRole}
+      )`);
+    }
+    if (f.teamId !== "") {
+      where.push(sql`(
+        EXISTS (
+          SELECT 1 FROM document_shares ds
+          WHERE ds.document_id = d.id AND ds.target_type = 'team' AND ds.team_id::text = ${f.teamId}
+        )
+        OR (
+          d.share_scope = ${ShareScope.AllTeams}
+          AND EXISTS (SELECT 1 FROM teams t WHERE t.id::text = ${f.teamId} AND t.is_active = TRUE)
+        )
+      )`);
+    }
+    if (f.createdFrom !== "") {
+      try {
+        const from = parseOptionalTime(f.createdFrom);
+        if (from) where.push(sql`d.created_at >= ${from}`);
+      } catch {
+        throw AppError.validation("invalid createdFrom");
+      }
+    }
+    if (f.createdTo !== "") {
+      try {
+        const to = parseOptionalTime(f.createdTo);
+        if (to) where.push(sql`d.created_at <= ${to}`);
+      } catch {
+        throw AppError.validation("invalid createdTo");
+      }
     }
     where = appendRecordScope(Records.Documents, where, f.scope, f.viewer);
     const count = await sql<{ total: number }>`SELECT COUNT(*) AS total FROM documents d WHERE ${and(where)}`.execute(this.db);
@@ -198,15 +318,17 @@ export class DocumentsRepository {
       ORDER BY COALESCE(d.uploaded_at, d.requested_at, d.created_at) DESC
       LIMIT ${limit} OFFSET ${f.offset}`.execute(this.db);
     return {
-      items: rows.rows.map((row) => ({
-        ...row,
-        viewerUserIds: Array.isArray(row.viewerUserIds) ? row.viewerUserIds : [],
-      })),
+      items: rows.rows.map(normalizeDoc),
       total: count.rows[0]?.total ?? 0,
     };
   }
 
-  async insertRequested(in_: RequestDocumentInput, expires: Date | null, status: string): Promise<DocumentRecord | null> {
+  async insertRequested(
+    in_: RequestDocumentInput,
+    expires: Date | null,
+    status: string,
+    share: DocumentSharePlan,
+  ): Promise<DocumentRecord | null> {
     const id = randomUUID();
     let docType = in_.type.trim();
     if (docType === "") docType = in_.category.trim();
@@ -214,10 +336,11 @@ export class DocumentsRepository {
     if (category === "") category = docType;
     await sql`
       INSERT INTO documents (
-        id, name, category, doc_type, status, requested_at, expires_at, notes, lead_id, customer_id, deal_id
+        id, name, category, doc_type, status, requested_at, expires_at, notes,
+        lead_id, customer_id, deal_id, share_scope
       ) VALUES (
         ${id}, ${in_.name.trim()}, ${category}, ${docType}, ${status}, ${new Date()}, ${expires}, ${in_.notes},
-        ${blankToNull(in_.leadId)}, ${blankToNull(in_.customerId)}, ${blankToNull(in_.dealId)}
+        ${blankToNull(in_.leadId)}, ${blankToNull(in_.customerId)}, ${blankToNull(in_.dealId)}, ${share.shareScope}
       )`.execute(this.db);
     return this.get(id);
   }
@@ -227,18 +350,22 @@ export class DocumentsRepository {
     actorId: string,
     file: { key: string; provider: string; mime: string; size: number },
     expires: Date | null,
+    share: DocumentSharePlan,
   ): Promise<DocumentRecord | null> {
     const id = randomUUID();
     const docType = in_.type === "" ? in_.category : in_.type;
     const category = in_.category === "" ? docType : in_.category;
+    const originalFilename = (in_.originalFilename ?? "").trim();
     await sql`
       INSERT INTO documents (
         id, name, category, doc_type, status, file_key, storage_provider, mime_type, size_bytes,
-        uploaded_by, uploaded_at, expires_at, notes, lead_id, customer_id, deal_id
+        uploaded_by, uploaded_at, expires_at, notes, lead_id, customer_id, deal_id,
+        share_scope, original_filename
       ) VALUES (
         ${id}, ${in_.name}, ${category}, ${docType}, 'uploaded', ${file.key}, ${file.provider}, ${file.mime}, ${file.size},
         ${blankToNull(actorId)}, ${new Date()}, ${expires}, ${in_.notes},
-        ${blankToNull(in_.leadId)}, ${blankToNull(in_.customerId)}, ${blankToNull(in_.dealId)}
+        ${blankToNull(in_.leadId)}, ${blankToNull(in_.customerId)}, ${blankToNull(in_.dealId)},
+        ${share.shareScope}, ${originalFilename}
       )`.execute(this.db);
     return this.get(id);
   }
@@ -271,7 +398,14 @@ export class DocumentsRepository {
     return this.get(id);
   }
 
-  async updateMeta(id: string, cur: DocumentRecord, in_: UpdateDocumentInput, expires: Date | null, setExpires: boolean) {
+  async updateMeta(
+    id: string,
+    cur: DocumentRecord,
+    in_: UpdateDocumentInput,
+    expires: Date | null,
+    setExpires: boolean,
+    share: DocumentSharePlan | undefined,
+  ) {
     await sql`
       UPDATE documents SET
         name = ${in_.name !== undefined ? in_.name.trim() : cur.name},
@@ -279,7 +413,8 @@ export class DocumentsRepository {
         category = ${in_.category !== undefined ? in_.category.trim() : cur.category},
         notes = ${in_.notes ?? cur.notes},
         status = ${in_.status !== undefined ? in_.status.trim() : cur.status},
-        expires_at = ${setExpires ? expires : cur.expiryDate}
+        expires_at = ${setExpires ? expires : cur.expiryDate},
+        share_scope = ${share ? share.shareScope : cur.shareScope}
       WHERE id = ${id}`.execute(this.db);
     return this.get(id);
   }
@@ -288,64 +423,137 @@ export class DocumentsRepository {
     await sql`DELETE FROM documents WHERE id = ${id}`.execute(this.db);
   }
 
-  async replaceViewers(documentId: string, userIds: string[]): Promise<void> {
+  async replaceShares(documentId: string, share: DocumentSharePlan): Promise<void> {
+    await sql`DELETE FROM document_shares WHERE document_id = ${documentId}`.execute(this.db);
     await sql`DELETE FROM document_viewers WHERE document_id = ${documentId}`.execute(this.db);
-    for (const userId of userIds) {
+    for (const teamId of share.teamIds) {
       await sql`
-        INSERT INTO document_viewers (document_id, user_id)
-        VALUES (${documentId}, ${userId})
-        ON CONFLICT DO NOTHING`.execute(this.db);
+        INSERT INTO document_shares (document_id, target_type, team_id)
+        VALUES (${documentId}, 'team', ${teamId})`.execute(this.db);
+    }
+    for (const userId of share.userIds) {
+      await sql`
+        INSERT INTO document_shares (document_id, target_type, user_id)
+        VALUES (${documentId}, 'user', ${userId})`.execute(this.db);
     }
   }
 
-  /**
-   * Viewer IDs must be active Sales Executives on the caller's team
-   * (any team for Super Admin).
-   */
-  async resolveViewerIds(claims: Claims, raw: string[] | undefined): Promise<string[]> {
+  private uniqueIds(raw: string[] | undefined, field: string): string[] {
     if (raw === undefined) return [];
     const unique: string[] = [];
     for (const id of raw) {
       const trimmed = id.trim();
       if (trimmed === "") continue;
-      if (!isUuid(trimmed)) throw AppError.validation("invalid viewerUserIds");
+      if (!isUuid(trimmed)) throw AppError.validation(`invalid ${field}`);
       if (!unique.includes(trimmed)) unique.push(trimmed);
     }
-    if (unique.length === 0) return [];
+    return unique;
+  }
 
-    let rows: { id: string }[];
-    if (claims.roleCode === Role.SuperAdmin) {
-      const r = await sql<{ id: string }>`
-        SELECT u.id::text AS id
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE u.id = ANY(${unique}::uuid[])
-          AND u.is_active = TRUE
-          AND r.code = ${Role.SalesExecutive}`.execute(this.db);
-      rows = r.rows;
-    } else {
-      if (claims.teamIds.length === 0) throw AppError.validation("viewerUserIds must be Sales Executives on your team");
-      const r = await sql<{ id: string }>`
-        SELECT DISTINCT u.id::text AS id
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        JOIN team_members tm ON tm.user_id = u.id
-        WHERE u.id = ANY(${unique}::uuid[])
-          AND u.is_active = TRUE
-          AND r.code = ${Role.SalesExecutive}
-          AND tm.team_id = ANY(${claims.teamIds}::uuid[])`.execute(this.db);
-      rows = r.rows;
+  async resolveTeamIds(raw: string[] | undefined): Promise<string[]> {
+    const unique = this.uniqueIds(raw, "teamIds");
+    if (unique.length === 0) return [];
+    const r = await sql<{ id: string }>`
+      SELECT t.id::text AS id
+      FROM teams t
+      WHERE t.id = ANY(${unique}::uuid[])
+        AND t.is_active = TRUE`.execute(this.db);
+    if (r.rows.length !== unique.length) throw AppError.validation("teamIds must be active teams");
+    return unique;
+  }
+
+  async resolveSeViewerIds(claims: Claims, raw: string[] | undefined): Promise<string[]> {
+    const unique = this.uniqueIds(raw, "viewerUserIds");
+    if (unique.length === 0) return [];
+    if (claims.teamIds.length === 0) {
+      throw AppError.validation("viewerUserIds must be Sales Executives on your team");
     }
-    if (rows.length !== unique.length) {
+    const r = await sql<{ id: string }>`
+      SELECT DISTINCT u.id::text AS id
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      JOIN team_members tm ON tm.user_id = u.id
+      WHERE u.id = ANY(${unique}::uuid[])
+        AND u.is_active = TRUE
+        AND r.code = ${Role.SalesExecutive}
+        AND tm.team_id = ANY(${claims.teamIds}::uuid[])`.execute(this.db);
+    if (r.rows.length !== unique.length) {
       throw AppError.validation("viewerUserIds must be Sales Executives on your team");
     }
     return unique;
   }
 
-  /** Always include the lead's SE owner so Files on that lead stay visible to them. */
-  async withLeadOwnerViewer(viewers: string[], leadId: string | undefined): Promise<string[]> {
+  /**
+   * Resolve role-based share plan. Lead-owner SE is appended as a user share so Files stay visible.
+   */
+  async resolveSharePlan(claims: Claims, in_: ShareInput, leadId: string | undefined): Promise<DocumentSharePlan> {
+    const rawScope = (in_.shareScope ?? "").trim();
+    let scope: ShareScopeCode;
+    if (rawScope === "") {
+      const hasTeams = (in_.teamIds?.length ?? 0) > 0;
+      const hasUsers = (in_.viewerUserIds?.length ?? 0) > 0;
+      if (claims.roleCode === Role.SuperAdmin) {
+        if (hasTeams) scope = ShareScope.SelectedTeams;
+        else if (hasUsers) throw AppError.validation("Admin must share with teams (use shareScope all_teams or selected_teams)");
+        else scope = ShareScope.None;
+      } else if (claims.roleCode === Role.SalesManager) {
+        if (hasUsers) scope = ShareScope.SelectedSes;
+        else if (hasTeams) scope = ShareScope.AllTeamSes;
+        else scope = ShareScope.None;
+      } else {
+        if (hasTeams || hasUsers) throw AppError.forbidden("insufficient permissions to share documents");
+        scope = ShareScope.None;
+      }
+    } else {
+      if (!VALID_SHARE_SCOPES.has(rawScope)) throw AppError.validation("invalid shareScope");
+      scope = rawScope as ShareScopeCode;
+    }
+
+    let teamIds: string[] = [];
+    let userIds: string[] = [];
+
+    if (claims.roleCode === Role.SuperAdmin) {
+      if (scope === ShareScope.AllTeams) {
+        teamIds = [];
+        userIds = [];
+      } else if (scope === ShareScope.SelectedTeams) {
+        teamIds = await this.resolveTeamIds(in_.teamIds);
+        if (teamIds.length === 0) throw AppError.validation("select at least one team");
+      } else if (scope === ShareScope.None) {
+        teamIds = [];
+        userIds = [];
+      } else {
+        throw AppError.validation("Admin may only use all_teams or selected_teams");
+      }
+    } else if (claims.roleCode === Role.SalesManager) {
+      const myTeam = claims.teamIds[0];
+      if (!myTeam) throw AppError.validation("Team Lead must belong to a team to share documents");
+      if (scope === ShareScope.AllTeamSes) {
+        teamIds = [myTeam];
+        userIds = [];
+      } else if (scope === ShareScope.SelectedSes) {
+        userIds = await this.resolveSeViewerIds(claims, in_.viewerUserIds);
+        if (userIds.length === 0) throw AppError.validation("select at least one Sales Executive");
+        teamIds = [];
+      } else if (scope === ShareScope.None) {
+        teamIds = [];
+        userIds = [];
+      } else {
+        throw AppError.validation("Team Lead may only use all_team_ses or selected_ses");
+      }
+    } else if (scope !== ShareScope.None) {
+      throw AppError.forbidden("insufficient permissions to share documents");
+    }
+
+    const leadOwner = await this.leadOwnerSeId(leadId);
+    if (leadOwner && !userIds.includes(leadOwner)) userIds = [...userIds, leadOwner];
+
+    return { shareScope: scope, teamIds, userIds };
+  }
+
+  async leadOwnerSeId(leadId: string | undefined): Promise<string | null> {
     const id = blankToNull(leadId);
-    if (!id) return viewers;
+    if (!id) return null;
     const r = await sql<{ ownerId: string }>`
       SELECT l.owner_user_id::text AS "ownerId"
       FROM leads l
@@ -354,9 +562,7 @@ export class DocumentsRepository {
       WHERE l.id = ${id}
         AND u.is_active = TRUE
         AND r.code = ${Role.SalesExecutive}`.execute(this.db);
-    const ownerId = r.rows[0]?.ownerId;
-    if (!ownerId || viewers.includes(ownerId)) return viewers;
-    return [...viewers, ownerId];
+    return r.rows[0]?.ownerId ?? null;
   }
 
   async refreshExpired(): Promise<void> {
@@ -413,44 +619,56 @@ export class DocumentsService {
 
   async request(claims: Claims, in_: RequestDocumentInput, meta: RequestMeta): Promise<DocumentRecord> {
     if (in_.name.trim() === "") throw AppError.validation("name is required");
-    const viewers = await this.repo.withLeadOwnerViewer(
-      await this.repo.resolveViewerIds(claims, in_.viewerUserIds),
-      in_.leadId,
-    );
+    const share = await this.repo.resolveSharePlan(claims, in_, in_.leadId);
     const status = in_.status === DocumentStatus.Missing ? DocumentStatus.Missing : DocumentStatus.Requested;
     const expires = parseExpiry(in_.expiryDate);
     const d = await internal("failed to request document", async () => {
-      const row = await this.repo.insertRequested(in_, expires, status);
+      const row = await this.repo.insertRequested(in_, expires, status, share);
       if (!row) throw new Error("inserted document not found");
-      await this.repo.replaceViewers(row.id, viewers);
+      await this.repo.replaceShares(row.id, share);
       return (await this.repo.get(row.id)) ?? row;
     });
-    await this.audit.record(claims.userId, "document.requested", "document", d.id, { name: d.name, type: d.type, status: d.status, viewerUserIds: viewers }, meta);
+    await this.audit.record(
+      claims.userId,
+      "document.requested",
+      "document",
+      d.id,
+      { name: d.name, type: d.type, status: d.status, shareScope: share.shareScope, teamIds: share.teamIds, viewerUserIds: share.userIds },
+      meta,
+    );
     await this.emit(claims.userId, TimelineEvent.DocumentRequested, "Document requested", `${d.name} (${d.type})`, d);
     return d;
   }
 
   async uploadNew(claims: Claims, in_: NewUpload, file: FileUpload, meta: RequestMeta): Promise<DocumentRecord> {
-    const input = { ...in_, name: in_.name.trim() === "" ? file.filename : in_.name };
+    const input = {
+      ...in_,
+      name: in_.name.trim() === "" ? file.filename : in_.name,
+      originalFilename: in_.originalFilename?.trim() || file.filename,
+    };
     if (input.name.trim() === "") throw AppError.validation("name is required");
-    const viewers = await this.repo.withLeadOwnerViewer(
-      await this.repo.resolveViewerIds(claims, in_.viewerUserIds),
-      input.leadId,
-    );
+    const share = await this.repo.resolveSharePlan(claims, input, input.leadId);
     const expires = parseExpiry(input.expiryDate);
     const dest = this.destination(input.type, input.category, input.customerId, input.dealId, input.leadId);
     const stored = await this.put(dest.store, dest.prefix, file);
     let d: DocumentRecord;
     try {
-      const row = await this.repo.createUploaded(input, claims.userId, stored, expires);
+      const row = await this.repo.createUploaded(input, claims.userId, stored, expires, share);
       if (!row) throw new Error("inserted document not found");
-      await this.repo.replaceViewers(row.id, viewers);
+      await this.repo.replaceShares(row.id, share);
       d = (await this.repo.get(row.id)) ?? row;
     } catch (err) {
       await dest.store.delete(stored.key).catch(() => undefined);
       throw AppError.internal("failed to save document", err);
     }
-    await this.audit.record(claims.userId, "document.uploaded", "document", d.id, { name: d.name, type: d.type, size: d.sizeBytes, viewerUserIds: viewers }, meta);
+    await this.audit.record(
+      claims.userId,
+      "document.uploaded",
+      "document",
+      d.id,
+      { name: d.name, type: d.type, size: d.sizeBytes, shareScope: share.shareScope, teamIds: share.teamIds, viewerUserIds: share.userIds },
+      meta,
+    );
     await this.afterUpload(claims.userId, d);
     return d;
   }
@@ -543,20 +761,55 @@ export class DocumentsService {
     const setExpires = in_.expiryDate !== undefined;
     if (setExpires) expires = parseExpiry(in_.expiryDate);
     if (in_.status !== undefined && !VALID_STATUSES.has(in_.status)) throw AppError.validation("invalid status");
-    const viewers =
-      in_.viewerUserIds !== undefined ? await this.repo.resolveViewerIds(claims, in_.viewerUserIds) : undefined;
+    const shareChanged =
+      in_.shareScope !== undefined || in_.teamIds !== undefined || in_.viewerUserIds !== undefined;
+    const share = shareChanged
+      ? await this.repo.resolveSharePlan(
+          claims,
+          {
+            shareScope: in_.shareScope ?? current.shareScope,
+            teamIds: in_.teamIds,
+            viewerUserIds: in_.viewerUserIds,
+          },
+          current.leadId ?? undefined,
+        )
+      : undefined;
     const d = await this.mutate("failed to update document", async () => {
-      const row = await this.repo.updateMeta(id, current, in_, expires, setExpires);
+      const row = await this.repo.updateMeta(id, current, in_, expires, setExpires, share);
       if (!row) return null;
-      if (viewers !== undefined) await this.repo.replaceViewers(id, viewers);
+      if (share) await this.repo.replaceShares(id, share);
       return (await this.repo.get(id)) ?? row;
     });
-    await this.audit.record(claims.userId, "document.updated", "document", id, { name: d.name, status: d.status, viewerUserIds: viewers }, meta);
+    await this.audit.record(
+      claims.userId,
+      "document.updated",
+      "document",
+      id,
+      {
+        name: d.name,
+        status: d.status,
+        shareScope: share?.shareScope,
+        teamIds: share?.teamIds,
+        viewerUserIds: share?.userIds,
+      },
+      meta,
+    );
     return d;
   }
 
-  async delete(actorId: string, id: string, meta: RequestMeta): Promise<void> {
+  /**
+   * Team Leads may only delete documents they uploaded.
+   * Super Admin (and other holders of documents:delete) may delete in-scope docs.
+   */
+  assertCanDelete(claims: Claims, doc: DocumentRecord): void {
+    if (claims.roleCode === Role.SalesManager && doc.uploadedBy !== claims.userId) {
+      throw AppError.forbidden("Team Leads can only delete documents they uploaded");
+    }
+  }
+
+  async delete(claims: Claims, id: string, meta: RequestMeta): Promise<void> {
     const d = await this.get(id);
+    this.assertCanDelete(claims, d);
     await internal("failed to delete document", () => this.repo.delete(id));
     if (d.fileKey !== "") {
       try {
@@ -565,7 +818,7 @@ export class DocumentsService {
         // The document row is already gone; object cleanup is best-effort.
       }
     }
-    await this.audit.record(actorId, "document.deleted", "document", id, { name: d.name }, meta);
+    await this.audit.record(claims.userId, "document.deleted", "document", id, { name: d.name }, meta);
   }
 
   private async mutate(message: string, fn: () => Promise<DocumentRecord | null>): Promise<DocumentRecord> {

@@ -45,6 +45,8 @@ export interface MoveLeadInput {
   lostReason?: string | undefined;
   /** YYYY-MM-DD send deadline; required when marking Sales Won (creates a document request). */
   documentDeadline?: string | undefined;
+  /** Whole amount saved as the lead value when marking Sales Won. */
+  closingAmount?: number | undefined;
   nextActivity?: NextActivityInput | undefined;
 }
 
@@ -107,6 +109,8 @@ export interface BoardStage {
   requiredFields: string[];
   requiredActivities: string[];
   requiredDocuments: string[];
+  /** Max hours a lead should stay in this stage; drives board age coloring. */
+  slaHours: number | null;
   count: number;
   totalValue: number;
   hasMore: boolean;
@@ -127,6 +131,8 @@ export interface BoardFilter {
   priority: string;
   source: string;
   tag: string;
+  /** Exact lead.country; "(Unknown)" matches blank. */
+  country: string;
   /** overdue | today | week | none | scheduled */
   activity: string;
   minValue?: number | null;
@@ -262,6 +268,12 @@ interface MovePlan {
   reopened: boolean;
   /** Keep won_at when handing a Won lead into Nurturing (status becomes open again). */
   preserveWonAt?: boolean;
+  closingAmount?: number | null;
+}
+
+export function parseClosingAmount(raw: number | undefined): number | null {
+  if (raw == null || !Number.isFinite(raw) || raw < 0 || !Number.isInteger(raw)) return null;
+  return raw;
 }
 
 const MOVABLE_SELECT = sql`
@@ -381,13 +393,24 @@ export class LeadStageService {
     }
 
     // Sales Won collects the document send deadline in the same step (Nurturing Complete is exempt).
-    if (toStage.isWon && toPipelineId !== NURTURING_PIPELINE_ID && lead.pipelineId !== NURTURING_PIPELINE_ID) {
+    const salesWon = toStage.isWon && toPipelineId !== NURTURING_PIPELINE_ID && lead.pipelineId !== NURTURING_PIPELINE_ID;
+    if (salesWon) {
       if (!parseDocumentDeadline(in_.documentDeadline)) {
         throw AppError.validation("Set a document send deadline before marking Won", {
           reason: "document_deadline_required",
           missingActivities: [],
           missingDocuments: ["send_deadline"],
           missingFields: [],
+          stageId: toStage.id,
+          stageName: toStage.name,
+        });
+      }
+      if (parseClosingAmount(in_.closingAmount) == null) {
+        throw AppError.validation("Enter the closing amount before closing this deal", {
+          reason: "closing_amount_required",
+          missingActivities: [],
+          missingDocuments: [],
+          missingFields: ["closing_amount"],
           stageId: toStage.id,
           stageName: toStage.name,
         });
@@ -405,6 +428,7 @@ export class LeadStageService {
       lostReason: toStage.isLost ? lostReason : "",
       forced: force,
       reopened: closed,
+      closingAmount: salesWon ? parseClosingAmount(in_.closingAmount) : null,
     };
   }
 
@@ -439,6 +463,10 @@ export class LeadStageService {
             END,
             lost_at = CASE WHEN ${toStage.isLost}::bool THEN ${now}::timestamptz ELSE NULL END,
             lost_reason = ${lostReason},
+            potential_value = CASE
+              WHEN ${plan.closingAmount != null}::bool THEN ${plan.closingAmount}
+              ELSE potential_value
+            END,
             last_activity_at = ${now}
           WHERE id = ${lead.id}`.execute(tx);
         await sql`
@@ -662,6 +690,13 @@ export class LeadStageService {
     if (f.priority !== "") where.push(sql`l.priority = ${f.priority}`);
     if (f.source !== "") where.push(sql`l.source = ${f.source}`);
     if (f.tag !== "") where.push(sql`${f.tag} = ANY(l.tags)`);
+    if (f.country !== "") {
+      if (f.country === "(Unknown)" || f.country === "(none)") {
+        where.push(sql`TRIM(l.country) = ''`);
+      } else {
+        where.push(sql`l.country = ${f.country}`);
+      }
+    }
     const activity = leadActivityPredicate(f.activity);
     if (activity) where.push(activity);
     where.push(...leadValuePredicates(f.minValue, f.maxValue));
@@ -810,6 +845,7 @@ export class LeadStageService {
             requiredFields: s.requiredFields,
             requiredActivities: s.requiredActivities,
             requiredDocuments: s.requiredDocuments,
+            slaHours: s.slaHours,
             count: wonCount,
             totalValue: wonValue,
             hasMore: wonCount > wonLeads.length,
@@ -830,6 +866,7 @@ export class LeadStageService {
           requiredFields: s.requiredFields,
           requiredActivities: s.requiredActivities,
           requiredDocuments: s.requiredDocuments,
+          slaHours: s.slaHours,
           count,
           totalValue: Number(t?.totalValue ?? 0),
           hasMore: count > leads.length,

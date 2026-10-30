@@ -47,6 +47,8 @@ const ALLOWED_KEYS = new Set([
   "notifications.activity_reminders",
   "notifications.overdue_alerts",
   "notifications.automation",
+  "notifications.sla_notify_team_lead",
+  "notifications.sla_scan_minutes",
   "security.session_hours",
 ]);
 

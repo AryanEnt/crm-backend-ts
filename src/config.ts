@@ -19,6 +19,13 @@ export interface Config {
   googleClientId: string;
   googleClientSecret: string;
   gmailPubSubTopic: string;
+  mailImapHost: string;
+  mailImapPort: number;
+  mailImapSecure: boolean;
+  mailSmtpHost: string;
+  mailSmtpPort: number;
+  mailSmtpSecure: boolean;
+  mailSyncIntervalMs: number;
   tokenEncryptionKey: string;
   /** Meta app for WhatsApp Embedded Signup (SE one-click connect). */
   metaAppId: string;
@@ -89,6 +96,13 @@ export function loadConfig(): Config {
     googleClientId: env("GOOGLE_CLIENT_ID"),
     googleClientSecret: env("GOOGLE_CLIENT_SECRET"),
     gmailPubSubTopic: env("GMAIL_PUBSUB_TOPIC"),
+    mailImapHost: env("MAIL_IMAP_HOST", "mail.entegrasources.com.np"),
+    mailImapPort: Number(env("MAIL_IMAP_PORT", "993")) || 993,
+    mailImapSecure: parseFlag("MAIL_IMAP_SECURE", true),
+    mailSmtpHost: env("MAIL_SMTP_HOST", env("MAIL_IMAP_HOST", "mail.entegrasources.com.np")),
+    mailSmtpPort: Number(env("MAIL_SMTP_PORT", "587")) || 587,
+    mailSmtpSecure: parseFlag("MAIL_SMTP_SECURE", false),
+    mailSyncIntervalMs: Number(env("MAIL_SYNC_INTERVAL_MS", "300000")) || 300_000,
     tokenEncryptionKey: env("TOKEN_ENCRYPTION_KEY", jwtSecret),
     metaAppId: env("META_APP_ID"),
     metaAppSecret: env("META_APP_SECRET"),

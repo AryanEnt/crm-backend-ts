@@ -28,6 +28,8 @@ const requestSchema = z.strictObject({
   expiryDate: optionalString(),
   notes: str(),
   status: str(),
+  shareScope: optionalString(),
+  teamIds: stringArray(),
   viewerUserIds: stringArray(),
 });
 
@@ -38,12 +40,14 @@ const updateSchema = z.strictObject({
   expiryDate: optionalString(),
   notes: optionalString(),
   status: optionalString(),
+  shareScope: optionalString(),
+  teamIds: stringArray(),
   viewerUserIds: stringArray(),
 });
 
-/** Multipart may send viewerUserIds as JSON array or comma-separated UUIDs. */
-function parseViewerUserIds(form: MultipartForm): string[] | undefined {
-  const raw = form.value("viewerUserIds").trim();
+/** Multipart may send JSON array or comma-separated UUIDs. */
+function parseIdList(form: MultipartForm, field: string): string[] | undefined {
+  const raw = form.value(field).trim();
   if (raw === "") return undefined;
   if (raw.startsWith("[")) {
     try {
@@ -51,7 +55,7 @@ function parseViewerUserIds(form: MultipartForm): string[] | undefined {
       if (!Array.isArray(parsed)) throw new Error("not an array");
       return parsed.map((v) => String(v).trim()).filter((v) => v !== "");
     } catch {
-      throw AppError.validation("invalid viewerUserIds");
+      throw AppError.validation(`invalid ${field}`);
     }
   }
   return raw
@@ -121,7 +125,6 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
   const router = createRouter();
   const view = [P.DocumentsView];
   const edit = [P.DocumentsEdit];
-  const del = [P.DocumentsDelete];
   const create = [P.DocumentsCreate];
 
   router.get("/api/v1/documents", ...guard(...view), async (req, res) => {
@@ -140,6 +143,12 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       type: q("type"),
       q: q("q"),
       excludeScreenshots: q("excludeScreenshots") === "1" || q("excludeScreenshots") === "true",
+      uploadedBy: q("uploadedBy"),
+      uploadedByRole: q("uploadedByRole"),
+      shareScope: q("shareScope"),
+      teamId: q("teamId"),
+      createdFrom: q("createdFrom"),
+      createdTo: q("createdTo"),
       limit,
       offset,
     });
@@ -188,6 +197,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       return;
     }
 
+    const notes = form.value("notes") || form.value("description");
     const input = {
       name: form.value("name") || file.filename,
       type: form.value("type") || form.value("category"),
@@ -196,8 +206,11 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       customerId: orUndefined(form.value("customerId")),
       dealId: orUndefined(form.value("dealId")),
       expiryDate: orUndefined(form.value("expiryDate")),
-      notes: form.value("notes"),
-      viewerUserIds: parseViewerUserIds(form),
+      notes,
+      shareScope: orUndefined(form.value("shareScope")),
+      teamIds: parseIdList(form, "teamIds"),
+      viewerUserIds: parseIdList(form, "viewerUserIds"),
+      originalFilename: file.filename,
     };
     await assertCanUploadNew(db, claims, input);
     created(res, await service.uploadNew(claims, input, upload, meta));
@@ -231,7 +244,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     } else {
       throw AppError.forbidden("insufficient permissions");
     }
-    await service.delete(claims.userId, id, requestMetaFirstHop(req));
+    await service.delete(claims, id, requestMetaFirstHop(req));
     ok(res, { deleted: true });
   });
 
@@ -239,9 +252,10 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     const { body, doc } = await service.open(pathParam(req, "id"));
     // ?inline=1 asks to view the file in the browser; only safe types are shown, everything else still downloads.
     const inline = queryParam(req, "inline") === "1" ? inlineContentType(doc.mimeType, doc.name) : null;
+    const downloadName = doc.originalFilename || doc.name;
     res.status(200);
     res.setHeader("Content-Type", rawHeader(inline ?? (doc.mimeType || "application/octet-stream")));
-    res.setHeader("Content-Disposition", rawHeader(`${inline ? "inline" : "attachment"}; filename="${goPathBase(doc.name)}"`));
+    res.setHeader("Content-Disposition", rawHeader(`${inline ? "inline" : "attachment"}; filename="${goPathBase(downloadName)}"`));
     res.setHeader("X-Content-Type-Options", "nosniff");
     if (doc.sizeBytes > 0) res.setHeader("Content-Length", String(doc.sizeBytes));
     await new Promise<void>((done) => {

@@ -272,6 +272,18 @@ export class PipelinesRepository {
     );
     return r.rows[0]?.ok === true;
   }
+
+  async stageUsage(stageId: string): Promise<{ leads: number; deals: number }> {
+    const r = await sql<{ leads: number; deals: number }>`
+      SELECT
+        (SELECT COUNT(*)::int FROM leads WHERE stage_id = ${stageId}::uuid) AS leads,
+        (SELECT COUNT(*)::int FROM deals WHERE stage_id = ${stageId}::uuid) AS deals`.execute(this.db);
+    return r.rows[0] ?? { leads: 0, deals: 0 };
+  }
+
+  async deleteStage(id: string): Promise<void> {
+    await sql`DELETE FROM pipeline_stages WHERE id = ${id}`.execute(this.db);
+  }
 }
 
 export class PipelinesService {
@@ -355,6 +367,40 @@ export class PipelinesService {
     await internal("failed to reorder stages", () => this.repo.reorderStages(pipelineId, stageIds));
     await this.audit.record(actorId, "pipeline.stages_reordered", "pipeline", pipelineId, { stageIds }, meta);
     return this.get(pipelineId);
+  }
+
+  async deleteStage(actorId: string, stageId: string, meta: RequestMeta): Promise<void> {
+    const cur = await internal("failed to load stage", () => this.repo.getStage(stageId));
+    if (!cur) throw AppError.notFound("stage not found");
+    if (cur.isWon || cur.isLost) {
+      throw AppError.validation("Won and Lost stages can't be deleted. Hide them instead if you need them off the board.");
+    }
+    const usage = await internal("failed to check stage usage", () => this.repo.stageUsage(stageId));
+    if (usage.leads > 0 || usage.deals > 0) {
+      const parts: string[] = [];
+      if (usage.leads > 0) parts.push(`${usage.leads} lead${usage.leads === 1 ? "" : "s"}`);
+      if (usage.deals > 0) parts.push(`${usage.deals} deal${usage.deals === 1 ? "" : "s"}`);
+      throw AppError.validation(
+        `This stage still has ${parts.join(" and ")}. Move them first, or hide the stage instead.`,
+      );
+    }
+    try {
+      await this.repo.deleteStage(stageId);
+    } catch (err) {
+      const code = typeof err === "object" && err && "code" in err ? String((err as { code: unknown }).code) : "";
+      if (code === "23503") {
+        throw AppError.validation("This stage has history and can't be removed. Hide it instead.");
+      }
+      throw AppError.internal("failed to delete stage", err);
+    }
+    await this.audit.record(
+      actorId,
+      "pipeline.stage_deleted",
+      "pipeline_stage",
+      stageId,
+      { pipelineId: cur.pipelineId, name: cur.name },
+      meta,
+    );
   }
 }
 

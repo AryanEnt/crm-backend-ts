@@ -160,6 +160,8 @@ export interface LeadListFilter {
   priority: string;
   anzscoId: string;
   tag: string;
+  /** Exact country name; "(Unknown)" matches blank country. */
+  country: string;
   createdFrom: string;
   createdTo: string;
   /** Won or lost on/after this instant (ISO timestamp). */
@@ -354,10 +356,9 @@ export class LeadsRepository {
     return this.get(id);
   }
 
-  async list(f: LeadListFilter): Promise<{ items: Lead[]; total: number }> {
-    const limit = f.limit <= 0 || f.limit > 100 ? 25 : f.limit;
-    const offset = Math.max(0, f.offset);
-
+  /** Shared list predicates. Pass `includeCountry: false` for country facet counts. */
+  private listWhere(f: LeadListFilter, opts: { includeCountry?: boolean } = {}): Predicate[] {
+    const includeCountry = opts.includeCountry !== false;
     // Same search fields as the board, so Won/Lost tables and board counts agree.
     const search = f.search.trim();
     let where: Predicate[] = [
@@ -410,6 +411,13 @@ export class LeadsRepository {
     if (f.priority !== "") where.push(sql`l.priority = ${f.priority}`);
     if (f.anzscoId !== "") where.push(sql`l.anzsco_id::text = ${f.anzscoId}`);
     if (f.tag !== "") where.push(sql`${f.tag} = ANY(l.tags)`);
+    if (includeCountry && f.country !== "") {
+      if (f.country === "(Unknown)" || f.country === "(none)") {
+        where.push(sql`TRIM(l.country) = ''`);
+      } else {
+        where.push(sql`l.country = ${f.country}`);
+      }
+    }
     where.push(...leadValuePredicates(f.minValue, f.maxValue));
     if (f.createdFrom !== "") where.push(sql`l.created_at >= ${f.createdFrom}::timestamptz`);
     if (f.createdTo !== "") where.push(sql`l.created_at < (${f.createdTo}::date + INTERVAL '1 day')`);
@@ -418,7 +426,13 @@ export class LeadsRepository {
     if (f.inactiveDays > 0) {
       where.push(sql`(l.last_activity_at IS NULL OR l.last_activity_at < NOW() - ${f.inactiveDays}::int * INTERVAL '1 day')`);
     }
-    where = appendScope(where, f.scope, Records.Leads.columns);
+    return appendScope(where, f.scope, Records.Leads.columns);
+  }
+
+  async list(f: LeadListFilter): Promise<{ items: Lead[]; total: number }> {
+    const limit = f.limit <= 0 || f.limit > 100 ? 25 : f.limit;
+    const offset = Math.max(0, f.offset);
+    const where = this.listWhere(f);
 
     const count = await sql<{ total: number }>`
       SELECT COUNT(*) AS total FROM leads l LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id WHERE ${and(where)}`.execute(this.db);
@@ -441,6 +455,21 @@ export class LeadsRepository {
       ${leadSelect} WHERE ${and(where)}
       ORDER BY ${sql.raw(`${sortCol} ${order}`)} NULLS LAST LIMIT ${limit} OFFSET ${offset}`.execute(this.db);
     return { items: rows.rows.map(toLead), total: count.rows[0]?.total ?? 0 };
+  }
+
+  /** Distinct residence countries for the caller's scoped, filtered lead set (country filter excluded). */
+  async listCountries(f: LeadListFilter): Promise<{ country: string; count: number }[]> {
+    const where = this.listWhere(f, { includeCountry: false });
+    const rows = await sql<{ country: string; count: number }>`
+      SELECT
+        CASE WHEN TRIM(COALESCE(l.country, '')) = '' THEN '(Unknown)' ELSE TRIM(l.country) END AS country,
+        COUNT(*)::int AS count
+      FROM leads l
+      LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+      WHERE ${and(where)}
+      GROUP BY 1
+      ORDER BY count DESC, country ASC`.execute(this.db);
+    return rows.rows.map((r) => ({ country: r.country, count: Number(r.count) }));
   }
 
   async create(
@@ -646,6 +675,12 @@ export class LeadsService {
     return internal("failed to list leads", () => this.repo.list(f));
   }
 
+  async listCountries(f: LeadListFilter): Promise<{ country: string; count: number }[]> {
+    if (!VALID_STATUSES.has(f.status)) throw AppError.validation("invalid status");
+    if (!validAttention(f.attention)) throw AppError.validation("invalid attention");
+    return internal("failed to list lead countries", () => this.repo.listCountries(f));
+  }
+
   async get(id: string): Promise<Lead> {
     const l = await internal("failed to load lead", () => this.repo.get(id));
     if (!l) throw AppError.notFound("lead not found");
@@ -668,6 +703,9 @@ export class LeadsService {
     const actorId = claims.userId;
     if (in_.fullName.trim() === "") throw AppError.validation("full name is required");
     if (in_.source.trim() === "") throw AppError.validation("lead source is required");
+    if (in_.country.trim() === "") throw AppError.fieldValidation("country", "country is required");
+    if (in_.nationality.trim() === "") throw AppError.fieldValidation("nationality", "nationality is required");
+    if (in_.location.trim() === "") throw AppError.fieldValidation("location", "location is required");
     const input = { ...in_, priority: in_.priority || "medium" };
     if (!VALID_PRIORITIES.has(input.priority)) throw AppError.validation("invalid priority");
     if (isReferralSource(input.source)) {

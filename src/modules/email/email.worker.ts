@@ -3,14 +3,15 @@ import type { EmailService } from "./email.service.js";
 
 const WATCH_INTERVAL_MS = 6 * 60 * 60_000;
 const SCHEDULE_INTERVAL_MS = 30_000;
+const DEFAULT_IMAP_INTERVAL_MS = 300_000;
 
 export interface EmailWorker {
   start(): void;
   stop(): Promise<void>;
 }
 
-/** Renews Gmail watches (at start, then every 6h) and sends due scheduled email every 30s, one task at a time. */
-export function createEmailWorker(service: EmailService): EmailWorker {
+/** Renews Gmail watches, polls IMAP mailboxes, and sends due scheduled email — one task at a time. */
+export function createEmailWorker(service: EmailService, imapIntervalMs = DEFAULT_IMAP_INTERVAL_MS): EmailWorker {
   const timers: NodeJS.Timeout[] = [];
   let chain: Promise<void> = Promise.resolve();
   let stopped = false;
@@ -30,10 +31,13 @@ export function createEmailWorker(service: EmailService): EmailWorker {
 
   return {
     start() {
+      const imapMs = imapIntervalMs > 30_000 ? imapIntervalMs : DEFAULT_IMAP_INTERVAL_MS;
       enqueue("initial", () => service.renewWatches());
+      enqueue("imap", () => service.syncDueImapMailboxes());
       timers.push(setInterval(() => enqueue("watch", () => service.renewWatches()), WATCH_INTERVAL_MS));
       timers.push(setInterval(() => enqueue("schedule", () => service.sendDueScheduled()), SCHEDULE_INTERVAL_MS));
-      logger.info("gmail email worker started");
+      timers.push(setInterval(() => enqueue("imap", () => service.syncDueImapMailboxes()), imapMs));
+      logger.info({ imapIntervalMs: imapMs }, "email worker started");
     },
     async stop() {
       stopped = true;

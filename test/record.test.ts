@@ -89,12 +89,19 @@ describe("requireRecord", () => {
     await expectCode(requireRecord(f.db, salesExec, Records.Deals, leadId, P.DealsView), "forbidden");
   });
 
-  it("documents follow their parent record or uploader", async () => {
+  it("documents follow their parent record, uploader, or team-aware shares", async () => {
     const f = fakeDb();
     f.setRows([{ ok: true }]);
     await requireRecord(f.db, salesExec, Records.Documents, leadId, P.DocumentsView);
     const q = f.queries[0]!;
-    for (const want of ["FROM leads pl", "FROM customers pc", "FROM deals pd", "d.uploaded_by = $"]) {
+    for (const want of [
+      "FROM leads pl",
+      "FROM customers pc",
+      "FROM deals pd",
+      "d.uploaded_by = $",
+      "document_shares",
+      "share_scope = 'all_teams'",
+    ]) {
       expect(q.sql).toContain(want);
     }
     expect(q.parameters.at(-1)).toBe(salesExec.userId);
