@@ -4,7 +4,7 @@ import { AppError } from "../../lib/app-error.js";
 import { goMapOrNull } from "../../lib/go-json.js";
 import { internal } from "../../lib/request-meta.js";
 
-export const NOTIFICATION_TYPES = ["lead_sla_exceeded"] as const;
+export const NOTIFICATION_TYPES = ["lead_sla_exceeded", "lead_phone_issue"] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 
 export interface InAppNotification {

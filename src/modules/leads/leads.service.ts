@@ -19,6 +19,11 @@ import type { SystemActivityService } from "../system-activity/system-activity.s
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
 import type { FollowUpScheduler } from "./lead-stage.service.js";
 import { leadActivityPredicate, leadValuePredicates, type LeadStageService } from "./lead-stage.service.js";
+import {
+  enqueuePhoneValidation,
+  PhoneValidationService,
+} from "./phone-validation.service.js";
+import type { PhoneValidationStatus } from "./phone-validation.js";
 
 export interface BulkStageResult {
   updated: number;
@@ -76,6 +81,17 @@ export interface Lead {
   attention: string;
   createdAt: Date;
   updatedAt: Date;
+  createdByUserId: string | null;
+  phoneCountryCode: string;
+  phoneValidationStatus: PhoneValidationStatus;
+  phoneNormalized: string | null;
+  phoneValidationMessage: string;
+  /** Duplicate lead IDs the caller is allowed to see (redacted in attachVisibleDuplicates). */
+  phoneDuplicateLeadIds: string[];
+  phoneDuplicateLeads: { id: string; fullName: string }[];
+  phoneValidatedAt: Date | null;
+  phoneLastNotifiedAt: Date | null;
+  phoneValidationVersion: number;
 }
 
 export interface CreateLeadInput {
@@ -106,6 +122,8 @@ export interface CreateLeadInput {
   expectedOutcome: string;
   nextActivityAt?: string | undefined;
   forceCreate: boolean;
+  /** ISO 3166-1 alpha-2 used as the default region for phone parsing. */
+  phoneCountryCode?: string | undefined;
   customFields?: Record<string, unknown> | undefined;
   referral?: ReferralInput | undefined;
 }
@@ -147,6 +165,7 @@ export interface UpdateLeadInput {
   /** Allows the PATCH to move a Won or Lost lead. */
   reopen?: boolean | undefined;
   forceUpdate: boolean;
+  phoneCountryCode?: string | undefined;
   customFields?: Record<string, unknown> | undefined;
   referral?: ReferralInput | undefined;
 }
@@ -214,10 +233,11 @@ export interface BulkStageInput {
   stageId: string;
 }
 
-type LeadRow = Omit<Lead, "attention" | "tags" | "skills"> & {
+type LeadRow = Omit<Lead, "attention" | "tags" | "skills" | "phoneDuplicateLeadIds" | "phoneDuplicateLeads"> & {
   tags: string[] | null;
   skills: string[] | null;
   slaHours: number | null;
+  phoneDuplicateLeadIds: string[] | null;
 };
 
 const leadSelect = sql`
@@ -238,7 +258,16 @@ const leadSelect = sql`
     l.converted_customer_id::text AS "convertedCustomerId", l.converted_at AS "convertedAt",
     l.is_archived AS "isArchived", l.archived_at AS "archivedAt",
     GREATEST(0, EXTRACT(DAY FROM NOW() - l.created_at)::int) AS "ageDays",
-    l.created_at AS "createdAt", l.updated_at AS "updatedAt", ps.sla_hours AS "slaHours"
+    l.created_at AS "createdAt", l.updated_at AS "updatedAt", ps.sla_hours AS "slaHours",
+    l.created_by_user_id::text AS "createdByUserId",
+    COALESCE(l.phone_country_code, '') AS "phoneCountryCode",
+    COALESCE(l.phone_validation_status, 'pending') AS "phoneValidationStatus",
+    l.phone_normalized AS "phoneNormalized",
+    COALESCE(l.phone_validation_message, '') AS "phoneValidationMessage",
+    COALESCE(l.phone_duplicate_lead_ids, '{}'::uuid[])::text[] AS "phoneDuplicateLeadIds",
+    l.phone_validated_at AS "phoneValidatedAt",
+    l.phone_last_notified_at AS "phoneLastNotifiedAt",
+    COALESCE(l.phone_validation_version, 0) AS "phoneValidationVersion"
   FROM leads l
   LEFT JOIN users ou ON ou.id = l.owner_user_id
   LEFT JOIN teams t ON t.id = l.team_id
@@ -255,7 +284,17 @@ function toLead(r: LeadRow): Lead {
     createdAt: r.createdAt,
     slaHours: r.slaHours,
   });
-  return orderLead({ ...r, tags: r.tags ?? [], skills: r.skills ?? [], attention });
+  const ids = (r.phoneDuplicateLeadIds ?? []).map(String);
+  return orderLead({
+    ...r,
+    tags: r.tags ?? [],
+    skills: r.skills ?? [],
+    attention,
+    phoneDuplicateLeadIds: ids,
+    phoneDuplicateLeads: [],
+    phoneValidationStatus: (r.phoneValidationStatus || "pending") as PhoneValidationStatus,
+    phoneValidationVersion: Number(r.phoneValidationVersion ?? 0),
+  });
 }
 
 /** Go struct field order. */
@@ -266,6 +305,8 @@ const LEAD_KEYS: (keyof Lead)[] = [
   "skills", "potentialValue", "currency", "probability", "expectedCloseAt", "expectedOutcome", "lastActivityAt",
   "nextActivityAt", "status", "wonAt", "lostAt", "lostReason", "stageEnteredAt", "daysInStage", "convertedCustomerId",
   "convertedAt", "isArchived", "archivedAt", "ageDays", "attention", "createdAt", "updatedAt",
+  "createdByUserId", "phoneCountryCode", "phoneValidationStatus", "phoneNormalized", "phoneValidationMessage",
+  "phoneDuplicateLeadIds", "phoneDuplicateLeads", "phoneValidatedAt", "phoneLastNotifiedAt", "phoneValidationVersion",
 ];
 
 function orderLead(l: Lead & { slaHours?: unknown }): Lead {
@@ -477,15 +518,18 @@ export class LeadsRepository {
     in_: CreateLeadInput,
     nextAt: Date | null,
     placement: { probability: number | null; closeDate: string | null },
+    createdByUserId: string,
   ): Promise<Lead | null> {
     const id = randomUUID();
+    const phoneCode = (in_.phoneCountryCode ?? "").trim().toUpperCase();
     await sql`
       INSERT INTO leads (
         id, full_name, email, phone, country, nationality, location,
         owner_user_id, team_id, source, priority, tags, anzsco_id,
         pipeline_id, stage_id, notes, occupation, job_title, employer,
         experience_years, qualification, skills, potential_value, currency, probability, expected_close_at,
-        expected_outcome, next_activity_at, last_activity_at, status, stage_entered_at
+        expected_outcome, next_activity_at, last_activity_at, status, stage_entered_at,
+        created_by_user_id, phone_country_code, phone_validation_status, phone_validation_message
       ) VALUES (
         ${id}, ${in_.fullName.trim()}, ${normalizeEmail(in_.email)}, ${normalizePhone(in_.phone)},
         ${in_.country}, ${in_.nationality}, ${in_.location},
@@ -494,9 +538,25 @@ export class LeadsRepository {
         ${nullIfBlank(in_.pipelineId)}, ${nullIfBlank(in_.stageId)}, ${in_.notes}, ${in_.occupation}, ${in_.jobTitle}, ${in_.employer},
         ${in_.experienceYears ?? null}, ${in_.qualification}, ${in_.skills ?? []}::text[], ${in_.potentialValue ?? null},
         ${in_.currency?.trim() || "AUD"}, ${placement.probability}, ${placement.closeDate}::date,
-        ${in_.expectedOutcome}, ${nextAt}, NOW(), 'open', NOW()
+        ${in_.expectedOutcome}, ${nextAt}, NOW(), 'open', NOW(),
+        ${createdByUserId}::uuid, ${phoneCode},
+        ${normalizePhone(in_.phone) ? "pending" : "valid"},
+        ${normalizePhone(in_.phone) ? "Queued for validation" : ""}
       )`.execute(this.db);
     return this.get(id);
+  }
+
+  async visibleLeadSummaries(
+    ids: string[],
+    scope: Visibility | null,
+  ): Promise<{ id: string; fullName: string }[]> {
+    if (ids.length === 0 || !scope) return [];
+    const rec = Records.Leads;
+    const where = appendScope([sql`l.id = ANY(${ids}::uuid[])`, sql`l.is_archived=FALSE`], scope, rec.columns);
+    const r = await sql<{ id: string; fullName: string }>`
+      SELECT l.id::text AS "id", l.full_name AS "fullName"
+      FROM leads l WHERE ${and(where)}`.execute(this.db);
+    return r.rows;
   }
 
   /** Field updates only: pipeline, stage and outcome columns belong to LeadStageService. */
@@ -515,6 +575,7 @@ export class LeadsRepository {
         full_name=${in_.fullName !== undefined ? in_.fullName.trim() : cur.fullName},
         email=${in_.email !== undefined ? normalizeEmail(in_.email) : cur.email},
         phone=${in_.phone !== undefined ? normalizePhone(in_.phone) : cur.phone},
+        phone_country_code=${in_.phoneCountryCode !== undefined ? in_.phoneCountryCode.trim().toUpperCase() : cur.phoneCountryCode},
         country=${pick(in_.country, cur.country)}, nationality=${pick(in_.nationality, cur.nationality)},
         location=${pick(in_.location, cur.location)},
         owner_user_id=${pickRef(in_.ownerUserId, cur.ownerUserId)}, team_id=${pickRef(in_.teamId, cur.teamId)},
@@ -608,9 +669,10 @@ export class LeadsRepository {
 
 export class LeadsService {
   readonly repo: LeadsRepository;
+  readonly phones: PhoneValidationService;
 
   constructor(
-    db: Database,
+    private readonly db: Database,
     private readonly audit: AuditService,
     private readonly timeline: TimelineService,
     private readonly hooks: AutomationEmitter,
@@ -622,6 +684,28 @@ export class LeadsService {
     private readonly followUps: FollowUpScheduler | null = null,
   ) {
     this.repo = new LeadsRepository(db);
+    this.phones = new PhoneValidationService(db);
+  }
+
+  /** Drop contact details for duplicate leads outside the caller's visibility. */
+  async attachVisibleDuplicates(leads: Lead[], claims: Claims): Promise<Lead[]> {
+    const allIds = [...new Set(leads.flatMap((l) => l.phoneDuplicateLeadIds))];
+    if (allIds.length === 0) {
+      return leads.map((l) => ({ ...l, phoneDuplicateLeads: [], phoneDuplicateLeadIds: [] }));
+    }
+    const scope = duplicateScopeFor(claims).leads;
+    const visible = await internal("failed to load duplicate leads", () =>
+      this.repo.visibleLeadSummaries(allIds, scope),
+    );
+    const map = new Map(visible.map((v) => [v.id, v]));
+    return leads.map((l) => {
+      const ids = l.phoneDuplicateLeadIds.filter((id) => map.has(id));
+      return {
+        ...l,
+        phoneDuplicateLeadIds: ids,
+        phoneDuplicateLeads: ids.map((id) => map.get(id)!),
+      };
+    });
   }
 
   /**
@@ -720,9 +804,12 @@ export class LeadsService {
     if (claims.teamIds.length > 0 && (!input.teamId || isSe)) input.teamId = claims.teamIds[0];
 
     const name = input.fullName.trim();
-    const dups = await internal("failed to check duplicates", () =>
-      this.repo.findDuplicates("", normalizeEmail(input.email), normalizePhone(input.phone), name, duplicateScopeFor(claims)),
-    );
+    // Phone duplicates are handled asynchronously; only email/name soft-block create.
+    const dups = (
+      await internal("failed to check duplicates", () =>
+        this.repo.findDuplicates("", normalizeEmail(input.email), null, name, duplicateScopeFor(claims)),
+      )
+    ).filter((d) => d.reason !== "phone");
     if (dups.length > 0 && !input.forceCreate) return { duplicates: dups, needsReview: true };
 
     const nextAt = nextActivity(input.nextActivityAt);
@@ -733,7 +820,12 @@ export class LeadsService {
       input.stageId = placement.stage.id;
     }
     const lead = await internal("failed to create lead", async () => {
-      const l = await this.repo.create(input, nextAt, { probability: placement?.stage.probability ?? null, closeDate });
+      const l = await this.repo.create(
+        input,
+        nextAt,
+        { probability: placement?.stage.probability ?? null, closeDate },
+        actorId,
+      );
       if (!l) throw new Error("created lead not found");
       return l;
     });
@@ -772,7 +864,17 @@ export class LeadsService {
       metadata: { source: lead.source },
     });
     if (nextAt) await this.scheduleLeadFollowUp(actorId, lead, nextAt, meta);
-    return { lead };
+
+    const phoneMarked = await this.phones.markPending(
+      lead.id,
+      lead.phone,
+      input.phoneCountryCode ?? lead.phoneCountryCode,
+      lead.country,
+    );
+    if (phoneMarked.enqueue) enqueuePhoneValidation(this.phones, lead.id, phoneMarked.version);
+
+    const [enriched] = await this.attachVisibleDuplicates([await this.get(lead.id)], claims);
+    return { lead: enriched ?? lead };
   }
 
   async update(claims: Claims, id: string, in_: UpdateLeadInput, meta: RequestMeta): Promise<LeadWriteResult> {
@@ -790,9 +892,12 @@ export class LeadsService {
       assignTargetInScope(claims, newOwner !== curOwner ? newOwner : "", newTeam !== curTeam ? newTeam : "");
     }
 
-    const dups = await internal("failed to check duplicates", () =>
-      this.repo.findDuplicates(id, email, phone, name, duplicateScopeFor(claims)),
-    );
+    // Phone duplicates are async; email/name soft-block remains.
+    const dups = (
+      await internal("failed to check duplicates", () =>
+        this.repo.findDuplicates(id, email, null, name, duplicateScopeFor(claims)),
+      )
+    ).filter((d) => d.reason !== "phone");
     if (dups.length > 0 && !in_.forceUpdate) return { duplicates: dups, needsReview: true };
 
     const status = in_.status?.trim() ?? "";
@@ -896,7 +1001,26 @@ export class LeadsService {
         await this.clearLeadFollowUps(id);
       }
     }
-    return { lead };
+
+    const phoneChanged =
+      in_.phone !== undefined && (normalizePhone(in_.phone) ?? null) !== (cur.phone ?? null);
+    const countryChanged = in_.country !== undefined && in_.country !== cur.country;
+    const phoneCountryChanged =
+      in_.phoneCountryCode !== undefined &&
+      in_.phoneCountryCode.trim().toUpperCase() !== (cur.phoneCountryCode || "").toUpperCase();
+    if (phoneChanged || countryChanged || phoneCountryChanged) {
+      const marked = await this.phones.markPending(
+        id,
+        lead.phone,
+        in_.phoneCountryCode ?? lead.phoneCountryCode,
+        lead.country,
+      );
+      if (marked.enqueue) enqueuePhoneValidation(this.phones, id, marked.version);
+      lead = await this.get(id);
+    }
+
+    const [enriched] = await this.attachVisibleDuplicates([lead], claims);
+    return { lead: enriched ?? lead };
   }
 
   async archive(actorId: string, ids: string[] | undefined, archive: boolean, meta: RequestMeta): Promise<number> {

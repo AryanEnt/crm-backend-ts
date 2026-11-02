@@ -515,3 +515,154 @@ describe("lead routes", () => {
     expect(res.status).toBe(403);
   });
 });
+
+describe("LeadStageService.listHistory", () => {
+  const t0 = new Date("2026-10-15T03:45:00.000Z");
+  const t1 = new Date("2026-10-16T08:30:00.000Z");
+  const t2 = new Date("2026-10-18T05:15:00.000Z");
+
+  it("turns transitions into oldest-first stage periods with a live current duration", async () => {
+    const { f, svc } = service();
+    f.queue(
+      [lead({ stageId: PROPOSAL.id, stageName: "Proposal", stageEnteredAt: t2 })],
+      [
+        {
+          id: "tr-1",
+          leadId: "lead-1",
+          fromPipelineId: null,
+          fromStageId: null,
+          fromStageName: null,
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: null,
+          enteredAt: t0,
+          durationSeconds: null,
+          metadata: { kind: "created" },
+          createdAt: t0,
+        },
+        {
+          id: "tr-2",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: CREATED.id,
+          fromStageName: "Created",
+          toPipelineId: PIPE,
+          toStageId: PROPOSAL.id,
+          toStageName: "Proposal",
+          actorUserId: "u2",
+          actorName: "Ram",
+          fromStageEnteredAt: t0,
+          enteredAt: t1,
+          durationSeconds: Math.trunc((t1.getTime() - t0.getTime()) / 1000),
+          metadata: {},
+          createdAt: t1,
+        },
+      ],
+    );
+
+    const { periods, serverNow } = await svc.listHistory("lead-1");
+    expect(serverNow).toBeInstanceOf(Date);
+    expect(periods).toHaveLength(2);
+    expect(periods[0]).toMatchObject({
+      stageName: "Created",
+      enteredAt: t0,
+      exitedAt: t1,
+      movedToStageName: "Proposal",
+      enteredByName: "Asha",
+      exitedByName: "Ram",
+      isCurrent: false,
+      kind: "created",
+      durationSeconds: Math.trunc((t1.getTime() - t0.getTime()) / 1000),
+    });
+    expect(periods[1]).toMatchObject({
+      stageName: "Proposal",
+      enteredAt: t1,
+      exitedAt: null,
+      movedToStageName: null,
+      enteredByName: "Ram",
+      isCurrent: true,
+    });
+    expect(periods[1]!.durationSeconds).toBeGreaterThanOrEqual(Math.trunc((Date.now() - t1.getTime()) / 1000) - 2);
+  });
+
+  it("falls back to the lead's current stage when there are no transitions", async () => {
+    const { f, svc } = service();
+    f.queue([lead({ stageEnteredAt: t0 })], []);
+    const { periods } = await svc.listHistory("lead-1");
+    expect(periods).toHaveLength(1);
+    expect(periods[0]).toMatchObject({
+      stageName: "Created",
+      enteredAt: t0,
+      exitedAt: null,
+      isCurrent: true,
+      kind: "current",
+    });
+  });
+
+  it("moving back to an earlier stage creates a new period instead of rewriting the old one", async () => {
+    const { f, svc } = service();
+    f.queue(
+      [lead()],
+      [
+        {
+          id: "a",
+          leadId: "lead-1",
+          fromPipelineId: null,
+          fromStageId: null,
+          fromStageName: null,
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: null,
+          enteredAt: t0,
+          durationSeconds: null,
+          metadata: { kind: "created" },
+          createdAt: t0,
+        },
+        {
+          id: "b",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: CREATED.id,
+          fromStageName: "Created",
+          toPipelineId: PIPE,
+          toStageId: PROPOSAL.id,
+          toStageName: "Proposal",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: t0,
+          enteredAt: t1,
+          durationSeconds: 1000,
+          metadata: {},
+          createdAt: t1,
+        },
+        {
+          id: "c",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: PROPOSAL.id,
+          fromStageName: "Proposal",
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u2",
+          actorName: "Ram",
+          fromStageEnteredAt: t1,
+          enteredAt: t2,
+          durationSeconds: 2000,
+          metadata: {},
+          createdAt: t2,
+        },
+      ],
+    );
+    const { periods } = await svc.listHistory("lead-1");
+    expect(periods.map((p) => p.stageName)).toEqual(["Created", "Proposal", "Created"]);
+    expect(periods[0]!.isCurrent).toBe(false);
+    expect(periods[2]).toMatchObject({ stageName: "Created", isCurrent: true, enteredByName: "Ram" });
+  });
+});

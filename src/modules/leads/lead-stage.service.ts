@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { sql } from "kysely";
 import type { Database } from "../../db/database.js";
 import { AppError } from "../../lib/app-error.js";
+import { goMapOrNull } from "../../lib/go-json.js";
 import { internal, type RequestMeta } from "../../lib/request-meta.js";
 import type { FollowUpRequest, NextActivityInput } from "../activities/activities.service.js";
 import type { Claims } from "../auth/types.js";
@@ -57,6 +58,47 @@ export interface MoveOutcome {
   needsNextActivity: boolean;
   nextActivityId?: string;
 }
+
+/** One stage visit on a lead, oldest → newest. Built from lead_stage_transitions. */
+export interface LeadStagePeriod {
+  id: string;
+  leadId: string;
+  stageId: string;
+  stageName: string;
+  pipelineId: string;
+  enteredAt: Date;
+  exitedAt: Date | null;
+  /** Seconds in this stage. For the current stage this is computed from server now. */
+  durationSeconds: number;
+  movedToStageId: string | null;
+  movedToStageName: string | null;
+  /** Who moved the lead into this stage. */
+  enteredByUserId: string | null;
+  enteredByName: string | null;
+  /** Who moved the lead out of this stage; null while it is current. */
+  exitedByUserId: string | null;
+  exitedByName: string | null;
+  isCurrent: boolean;
+  kind: string | null;
+}
+
+type TransitionRow = {
+  id: string;
+  leadId: string;
+  fromPipelineId: string | null;
+  fromStageId: string | null;
+  fromStageName: string | null;
+  toPipelineId: string;
+  toStageId: string;
+  toStageName: string;
+  actorUserId: string | null;
+  actorName: string | null;
+  fromStageEnteredAt: Date | null;
+  enteredAt: Date;
+  durationSeconds: number | null;
+  metadata: unknown;
+  createdAt: Date;
+};
 
 export interface FollowUpScheduler {
   scheduleFollowUp(actorId: string, in_: FollowUpRequest, meta: RequestMeta): Promise<string>;
@@ -339,6 +381,90 @@ export class LeadStageService {
       VALUES (${randomUUID()}, ${leadId}, ${pipelineId}, ${stage.id}, ${actorUserId}, ${JSON.stringify({ kind: "created" })}::jsonb)`
       .execute(this.db)
       .catch(() => undefined);
+  }
+
+  /**
+   * Chronological stage periods for the Lead History UI. Each transition starts a period in
+   * its to_stage; the next transition closes it. The open period's duration uses server time.
+   */
+  async listHistory(leadId: string): Promise<{ periods: LeadStagePeriod[]; serverNow: Date }> {
+    const lead = await this.loadMovable(leadId);
+    const r = await internal("failed to load lead stage history", () =>
+      sql<TransitionRow>`
+        SELECT t.id::text AS "id", t.lead_id::text AS "leadId",
+          t.from_pipeline_id::text AS "fromPipelineId", t.from_stage_id::text AS "fromStageId", fs.name AS "fromStageName",
+          t.to_pipeline_id::text AS "toPipelineId", t.to_stage_id::text AS "toStageId", ts.name AS "toStageName",
+          t.actor_user_id::text AS "actorUserId", u.full_name AS "actorName",
+          t.from_stage_entered_at AS "fromStageEnteredAt", t.entered_at AS "enteredAt",
+          t.duration_seconds AS "durationSeconds", t.metadata, t.created_at AS "createdAt"
+        FROM lead_stage_transitions t
+        LEFT JOIN pipeline_stages fs ON fs.id = t.from_stage_id
+        LEFT JOIN pipeline_stages ts ON ts.id = t.to_stage_id
+        LEFT JOIN users u ON u.id = t.actor_user_id
+        WHERE t.lead_id = ${leadId}
+        ORDER BY t.entered_at ASC, t.created_at ASC`.execute(this.db),
+    );
+    const now = new Date();
+    const rows = r.rows;
+    if (rows.length === 0) {
+      // No stored transitions: show the current stage from the lead row only (do not invent past moves).
+      if (!lead.stageId || !lead.pipelineId) return { periods: [], serverNow: now };
+      const enteredAt = lead.stageEnteredAt ?? lead.createdAt;
+      return {
+        periods: [
+          {
+            id: `current-${lead.id}`,
+            leadId: lead.id,
+            stageId: lead.stageId,
+            stageName: lead.stageName ?? "Current stage",
+            pipelineId: lead.pipelineId,
+            enteredAt,
+            exitedAt: null,
+            durationSeconds: Math.max(0, Math.trunc((now.getTime() - enteredAt.getTime()) / 1000)),
+            movedToStageId: null,
+            movedToStageName: null,
+            enteredByUserId: null,
+            enteredByName: null,
+            exitedByUserId: null,
+            exitedByName: null,
+            isCurrent: true,
+            kind: "current",
+          },
+        ],
+        serverNow: now,
+      };
+    }
+
+    const periods: LeadStagePeriod[] = rows.map((row, i) => {
+      const next = rows[i + 1];
+      const isCurrent = !next;
+      const enteredAt = row.enteredAt;
+      const exitedAt = next?.enteredAt ?? null;
+      const durationSeconds = isCurrent
+        ? Math.max(0, Math.trunc((now.getTime() - enteredAt.getTime()) / 1000))
+        : Math.max(0, next.durationSeconds ?? Math.trunc((exitedAt!.getTime() - enteredAt.getTime()) / 1000));
+      const meta = goMapOrNull(row.metadata) ?? {};
+      const kind = typeof meta.kind === "string" ? meta.kind : null;
+      return {
+        id: row.id,
+        leadId: row.leadId,
+        stageId: row.toStageId,
+        stageName: row.toStageName || "Stage",
+        pipelineId: row.toPipelineId,
+        enteredAt,
+        exitedAt,
+        durationSeconds,
+        movedToStageId: next?.toStageId ?? null,
+        movedToStageName: next?.toStageName ?? null,
+        enteredByUserId: row.actorUserId,
+        enteredByName: row.actorName,
+        exitedByUserId: next?.actorUserId ?? null,
+        exitedByName: next?.actorName ?? null,
+        isCurrent,
+        kind,
+      };
+    });
+    return { periods, serverNow: now };
   }
 
   /**

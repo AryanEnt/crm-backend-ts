@@ -59,6 +59,7 @@ const createSchema = z.strictObject({
   expectedOutcome: str(),
   nextActivityAt: optionalString(),
   forceCreate: bool(),
+  phoneCountryCode: optionalString(),
   customFields: anyMap(),
   referral: optionalObject(referralInputSchema),
 });
@@ -67,6 +68,7 @@ const updateSchema = z.strictObject({
   fullName: optionalString(),
   email: optionalString(),
   phone: optionalString(),
+  phoneCountryCode: optionalString(),
   country: optionalString(),
   nationality: optionalString(),
   location: optionalString(),
@@ -230,9 +232,10 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
   router.get("/api/v1/leads", ...guard(P.LeadsView), async (req, res) => {
     const f = listFilter(req);
     const { items, total } = await service.list(f);
+    const data = await service.attachVisibleDuplicates(items, claimsOf(req));
     sendJson(res, 200, {
       success: true,
-      data: items,
+      data,
       meta: { total, limit: f.limit, offset: f.offset },
     });
   });
@@ -295,7 +298,13 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
   });
 
   router.get("/api/v1/leads/:id", ...guard(...view), inScope(db, Records.Leads, view), async (req, res) => {
-    ok(res, await service.get(pathParam(req, "id")));
+    const lead = await service.get(pathParam(req, "id"));
+    const [enriched] = await service.attachVisibleDuplicates([lead], claimsOf(req));
+    ok(res, enriched ?? lead);
+  });
+
+  router.get("/api/v1/leads/:id/stage-history", ...guard(...view), inScope(db, Records.Leads, view), async (req, res) => {
+    ok(res, await service.stages.listHistory(pathParam(req, "id")));
   });
 
   router.patch("/api/v1/leads/:id", ...guard(...edit), inScope(db, Records.Leads, edit), jsonBody, async (req, res) => {

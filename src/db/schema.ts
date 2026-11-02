@@ -477,6 +477,7 @@ export interface Leads {
   converted_customer_id: string | null;
   country: Generated<string>;
   created_at: Generated<Timestamp>;
+  created_by_user_id: string | null;
   currency: Generated<string>;
   email: string | null;
   employer: Generated<string>;
@@ -497,6 +498,15 @@ export interface Leads {
   occupation: Generated<string>;
   owner_user_id: string | null;
   phone: string | null;
+  phone_country_code: Generated<string>;
+  phone_duplicate_lead_ids: Generated<string[]>;
+  phone_input_hash: Generated<string>;
+  phone_last_notified_at: Timestamp | null;
+  phone_normalized: string | null;
+  phone_validated_at: Timestamp | null;
+  phone_validation_message: Generated<string>;
+  phone_validation_status: Generated<string>;
+  phone_validation_version: Generated<number>;
   pipeline_id: string | null;
   potential_value: number | null;
   priority: Generated<string>;
