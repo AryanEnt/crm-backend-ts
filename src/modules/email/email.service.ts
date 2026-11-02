@@ -399,8 +399,19 @@ export class EmailService {
     };
   }
 
+  /**
+   * Server settings for this mailbox only.
+   * Never fall back to the company MAIL_* hosts unless that server actually serves
+   * this mailbox's domain — otherwise @other.com mail is sent via entegrasources SMTP and rejected.
+   */
   private settingsForAccount(acc: AccountRecord): ImapSmtpSettings {
-    return resolveImapSettings(
+    const domain = domainOfEmail(acc.emailAddress);
+    const company = this.envImapSettings();
+    const companyServesMailbox =
+      Boolean(company.imapHost.trim() && company.smtpHost.trim()) &&
+      hostServesDomain(company.imapHost, domain) &&
+      hostServesDomain(company.smtpHost, domain);
+    const settings = resolveImapSettings(
       acc.provider,
       {
         imapHost: acc.imapHost,
@@ -410,14 +421,18 @@ export class EmailService {
         smtpPort: acc.smtpPort,
         smtpSecure: acc.smtpSecure,
       },
-      this.envImapSettings(),
+      companyServesMailbox ? company : undefined,
     );
+    if (!settings.smtpHost.trim()) {
+      throw AppError.validation(
+        `No SMTP server is configured for ${acc.emailAddress}. Reconnect the mailbox in Team Email (pick Migadu, Spacemail, or the correct custom host for @${domain}).`,
+      );
+    }
+    return settings;
   }
 
   private transportFor(acc: AccountRecord): MailTransport {
-    const settings = this.settingsForAccount(acc);
-    if (!settings.imapHost && !settings.smtpHost) return this.imap;
-    return this.createImap(settings);
+    return this.createImap(this.settingsForAccount(acc));
   }
 
   private hostPolicy() {
@@ -1386,9 +1401,14 @@ export class EmailService {
     m: Message,
     meta: RequestMeta,
   ): Promise<Message | null> {
+    const settings = this.settingsForAccount(acc);
     let sent;
     try {
-      sent = await this.transportFor(acc).send(this.mailboxAuth(acc), {
+      logger.info(
+        { account: acc.id, from: acc.emailAddress, smtpHost: settings.smtpHost, provider: acc.provider },
+        "sending via mailbox SMTP",
+      );
+      sent = await this.createImap(settings).send(this.mailboxAuth(acc), {
         fromName: acc.displayName,
         fromAddress: acc.emailAddress,
         to: m.toAddresses,
@@ -1402,7 +1422,16 @@ export class EmailService {
       });
     } catch (err) {
       const safe = classifyMailError(err);
-      logger.warn({ code: safe.code, stage: safe.stage, account: acc.id, cause: safe.diagnostics }, "imap send failed");
+      logger.warn(
+        {
+          code: safe.code,
+          stage: safe.stage,
+          account: acc.id,
+          smtpHost: settings.smtpHost,
+          cause: safe.diagnostics,
+        },
+        "imap send failed",
+      );
       m.status = "failed";
       await this.repo.updateMessage(m).catch(() => undefined);
       await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: safe.code }, meta);
