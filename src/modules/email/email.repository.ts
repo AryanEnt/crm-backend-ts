@@ -22,6 +22,14 @@ export interface AccountPublic {
   createdAt: Date;
   ownerUserId?: string;
   ownerName?: string;
+  username?: string;
+  managerUserId?: string | null;
+  imapHost?: string;
+  imapPort?: number;
+  imapSecure?: boolean;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpSecure?: boolean;
 }
 
 export interface AccountRecord extends AccountPublic {
@@ -38,6 +46,14 @@ export interface AccountRecord extends AccountPublic {
   imapInboxUid: number;
   imapSentUidValidity: number;
   imapSentUid: number;
+  username: string;
+  managerUserId: string | null;
+  imapHost: string;
+  imapPort: number;
+  imapSecure: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
 }
 
 export interface ConnectionInvite {
@@ -173,6 +189,11 @@ export function accountJson(a: AccountPublic): Json {
     lastSyncAt: a.lastSyncAt,
     ...(a.lastSyncError !== "" && { lastSyncError: a.lastSyncError }),
     createdAt: a.createdAt,
+    ownerUserId: a.ownerUserId ?? (a as { userId?: string }).userId,
+    ...(a.username && { username: a.username }),
+    ...(a.managerUserId && { managerUserId: a.managerUserId }),
+    ...(a.imapHost && { imapHost: a.imapHost, imapPort: a.imapPort, imapSecure: a.imapSecure }),
+    ...(a.smtpHost && { smtpHost: a.smtpHost, smtpPort: a.smtpPort, smtpSecure: a.smtpSecure }),
   };
 }
 
@@ -248,7 +269,12 @@ const accountSelect = sql`
     COALESCE(a.imap_inbox_uidvalidity,0)::float8 AS "imapInboxUidValidity",
     COALESCE(a.imap_inbox_uid,0)::float8 AS "imapInboxUid",
     COALESCE(a.imap_sent_uidvalidity,0)::float8 AS "imapSentUidValidity",
-    COALESCE(a.imap_sent_uid,0)::float8 AS "imapSentUid"
+    COALESCE(a.imap_sent_uid,0)::float8 AS "imapSentUid",
+    COALESCE(a.username,'') AS "username", a.manager_user_id::text AS "managerUserId",
+    COALESCE(a.imap_host,'') AS "imapHost", COALESCE(a.imap_port,993)::int AS "imapPort",
+    COALESCE(a.imap_secure,TRUE) AS "imapSecure",
+    COALESCE(a.smtp_host,'') AS "smtpHost", COALESCE(a.smtp_port,465)::int AS "smtpPort",
+    COALESCE(a.smtp_secure,TRUE) AS "smtpSecure"
   FROM email_accounts a`;
 
 const threadSelect = sql`
@@ -473,6 +499,17 @@ export class EmailRepository {
       WHERE id=${id}`.execute(this.db);
   }
 
+  async disconnectOtherImap(userId: string, keepId: string): Promise<void> {
+    await sql`
+      UPDATE email_accounts SET
+        connection_status='disconnected',
+        encrypted_password='',
+        updated_at=NOW()
+      WHERE user_id=${userId} AND id<>${keepId}
+        AND provider IN ('imap','migadu','spacemail')
+        AND connection_status <> 'disconnected'`.execute(this.db);
+  }
+
   async listAccountsNeedingWatch(): Promise<AccountRecord[]> {
     const r = await sql<AccountRecord>`
       ${accountSelect}
@@ -484,32 +521,68 @@ export class EmailRepository {
   async listImapAccountsDue(): Promise<AccountRecord[]> {
     const r = await sql<AccountRecord>`
       ${accountSelect}
-      WHERE a.provider='imap' AND a.connection_status IN ('connected','syncing','error')`.execute(this.db);
+      WHERE a.provider IN ('imap','migadu','spacemail')
+        AND a.encrypted_password <> ''
+        AND a.connection_status IN ('connected','syncing','error')
+        AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.user_id AND u.is_active = TRUE)`.execute(this.db);
     return r.rows;
+  }
+
+  async teamTodayCounts(userIds: string[]): Promise<Map<string, { sent: number; received: number }>> {
+    const out = new Map<string, { sent: number; received: number }>();
+    if (userIds.length === 0) return out;
+    const r = await sql<{ ownerUserId: string; sent: number; received: number }>`
+      SELECT m.owner_user_id::text AS "ownerUserId",
+        COUNT(*) FILTER (
+          WHERE m.direction='outbound' AND m.status IN ('sent','delivered','sending')
+            AND COALESCE(m.sent_at, m.created_at) >= date_trunc('day', NOW())
+        )::int AS "sent",
+        COUNT(*) FILTER (
+          WHERE m.direction='inbound' AND COALESCE(m.received_at, m.created_at) >= date_trunc('day', NOW())
+        )::int AS "received"
+      FROM email_messages m
+      WHERE m.owner_user_id = ANY(${userIds}::uuid[])
+      GROUP BY m.owner_user_id`.execute(this.db);
+    for (const row of r.rows) out.set(row.ownerUserId, { sent: row.sent, received: row.received });
+    return out;
   }
 
   async upsertImapAccount(rec: {
     userId: string;
+    managerUserId: string;
+    provider: string;
     emailAddress: string;
+    username: string;
     displayName: string;
     encryptedPassword: string;
     inboxFolder: string;
     sentFolder: string;
+    imapHost: string;
+    imapPort: number;
+    imapSecure: boolean;
+    smtpHost: string;
+    smtpPort: number;
+    smtpSecure: boolean;
   }): Promise<AccountRecord | null> {
     const r = await sql<{ id: string }>`
       INSERT INTO email_accounts (
-        id, user_id, provider, email_address, display_name, avatar_url,
+        id, user_id, manager_user_id, provider, email_address, username, display_name, avatar_url,
         encrypted_access_token, encrypted_refresh_token, encrypted_password,
         connection_status, sending_enabled, receiving_enabled, last_sync_error,
-        imap_inbox_folder, imap_sent_folder
+        imap_inbox_folder, imap_sent_folder,
+        imap_host, imap_port, imap_secure, smtp_host, smtp_port, smtp_secure
       ) VALUES (
-        ${randomUUID()}, ${rec.userId}, 'imap', ${rec.emailAddress}, ${rec.displayName}, '',
+        ${randomUUID()}, ${rec.userId}, ${rec.managerUserId}, ${rec.provider}, ${rec.emailAddress}, ${rec.username},
+        ${rec.displayName}, '',
         '', '', ${rec.encryptedPassword},
         'connected', TRUE, TRUE, '',
-        ${rec.inboxFolder}, ${rec.sentFolder}
+        ${rec.inboxFolder}, ${rec.sentFolder},
+        ${rec.imapHost}, ${rec.imapPort}, ${rec.imapSecure}, ${rec.smtpHost}, ${rec.smtpPort}, ${rec.smtpSecure}
       )
       ON CONFLICT (user_id, email_address) DO UPDATE SET
-        provider='imap',
+        provider=EXCLUDED.provider,
+        manager_user_id=EXCLUDED.manager_user_id,
+        username=EXCLUDED.username,
         encrypted_password=EXCLUDED.encrypted_password,
         connection_status='connected',
         sending_enabled=TRUE,
@@ -517,6 +590,12 @@ export class EmailRepository {
         last_sync_error='',
         imap_inbox_folder=EXCLUDED.imap_inbox_folder,
         imap_sent_folder=EXCLUDED.imap_sent_folder,
+        imap_host=EXCLUDED.imap_host,
+        imap_port=EXCLUDED.imap_port,
+        imap_secure=EXCLUDED.imap_secure,
+        smtp_host=EXCLUDED.smtp_host,
+        smtp_port=EXCLUDED.smtp_port,
+        smtp_secure=EXCLUDED.smtp_secure,
         updated_at=NOW()
       RETURNING id::text AS "id"`.execute(this.db);
     return this.getAccount(r.rows[0]!.id);
@@ -551,14 +630,10 @@ export class EmailRepository {
     return r.rows;
   }
 
-  async listAccountsForUsers(userIds: string[]): Promise<(AccountPublic & { ownerUserId: string })[]> {
+  async listAccountsForUsers(userIds: string[]): Promise<AccountRecord[]> {
     if (userIds.length === 0) return [];
-    const r = await sql<AccountPublic & { ownerUserId: string }>`
-      SELECT a.id::text AS "id", a.provider, a.email_address AS "emailAddress", a.display_name AS "displayName",
-        a.avatar_url AS "avatarUrl", a.connection_status AS "connectionStatus", a.sending_enabled AS "sendingEnabled",
-        a.receiving_enabled AS "receivingEnabled", a.last_sync_at AS "lastSyncAt", a.last_sync_error AS "lastSyncError",
-        a.created_at AS "createdAt", a.user_id::text AS "ownerUserId"
-      FROM email_accounts a
+    const r = await sql<AccountRecord>`
+      ${accountSelect}
       WHERE a.user_id = ANY(${userIds}::uuid[]) AND a.connection_status <> 'disconnected'
       ORDER BY a.created_at`.execute(this.db);
     return r.rows;

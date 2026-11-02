@@ -7,7 +7,7 @@ import type { RequestMeta } from "../../lib/request-meta.js";
 import { logger } from "../../logger.js";
 import type { AuditService } from "../audit/audit.service.js";
 import type { Claims } from "../auth/types.js";
-import { P, scopeFor } from "../permissions/permissions.js";
+import { expandImplies, P, Role, scopeFor } from "../permissions/permissions.js";
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
 import { decodeStdBase64, TokenBox } from "./crypto.js";
 import {
@@ -21,9 +21,29 @@ import {
   type ThreadListFilter,
 } from "./email.repository.js";
 import { collectBodies, GmailApiError, GmailClient, googleErrorLogFields, headerValue } from "./gmail.js";
-import { ImapSmtpTransport } from "./imap-smtp.js";
-import { assignedUserIds, canInviteUser, canManageMailbox, canSendFromMailbox } from "./mailbox-access.js";
-import { safeMailError, type FetchedMail, type MailTransport, type MailboxAuth } from "./mail-provider.js";
+import { ConnectLimiter } from "./connect-limiter.js";
+import {
+  DomainProviderRepository,
+  domainOfEmail,
+  settingsForDomainProvider,
+  validateDomainProvider,
+  type DomainProvider,
+  type DomainProviderInput,
+} from "./domain-providers.js";
+import { isImapProvider, normalizeImapProvider, resolveImapSettings, IMAP_PRESETS, type ImapProviderKind } from "./imap-presets.js";
+import { lookupMx, providerFromMx, isSelfHostedMx, hostServesDomain, primaryMxHost, type MxRecord } from "./mx-provider.js";
+import { ImapSmtpTransport, type ImapSmtpSettings } from "./imap-smtp.js";
+import { assertMailHostAllowed, parseHostAllowlist } from "./mail-host-guard.js";
+import { assignedUserIds, canChangeMailboxSettings, canInviteUser, canManageMailbox, canSendFromMailbox } from "./mailbox-access.js";
+import {
+  classifyMailError,
+  safeMailError,
+  type FetchedMail,
+  type MailConnectionCheck,
+  type MailErrorCode,
+  type MailTransport,
+  type MailboxAuth,
+} from "./mail-provider.js";
 import { applyVars, buildRfc822, findUnresolved, parseAddress, parseAddressList, parseInt64, stripTags, uniqueEmails } from "./mime.js";
 import { sanitizeEmailHtml } from "./sanitize.js";
 
@@ -42,6 +62,8 @@ export interface EmailConfig {
   mailSmtpPort?: number;
   mailSmtpSecure?: boolean;
   mailSyncIntervalMs?: number;
+  mailHostAllowlist?: string;
+  mailAllowPrivateHosts?: boolean;
 }
 
 export interface IntegrationHealth {
@@ -53,6 +75,8 @@ export interface IntegrationHealth {
   pushSyncHealthy: boolean;
   connectedAccounts: number;
   needsAttention: number;
+  /** The organisation's own IMAP/SMTP server (MAIL_IMAP_* / MAIL_SMTP_*), offered as the default preset. */
+  companyServer: ImapSmtpSettings | null;
   message?: string;
 }
 
@@ -109,6 +133,43 @@ export interface TemplateInput {
   teamId: Ref;
 }
 
+export type ImapConnectFields = {
+  ownerUserId?: string;
+  provider?: string;
+  emailAddress: string;
+  username?: string;
+  password: string;
+  inviteToken?: string;
+  imapHost?: string;
+  imapPort?: number;
+  imapSecure?: boolean;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpSecure?: boolean;
+};
+
+type MailboxStageResult =
+  | { ok: true; host: string; port: number; secure: boolean }
+  | { ok: false; host: string; port: number; secure: boolean; code: MailErrorCode; message: string };
+
+/** Where a mailbox's server settings came from: an admin mapping, the domain's MX records, or a TL's choice. */
+export type ProviderSource = "mapping" | "dns" | "override";
+
+export type MailboxCheckResult = {
+  requestId: string;
+  provider: string;
+  providerSource: ProviderSource;
+  imap: MailboxStageResult;
+  smtp: MailboxStageResult;
+};
+
+/** "priya@example.com" -> "p***@example.com"; logs need the domain, not the mailbox. */
+export function maskMailUser(user: string): string {
+  const at = user.lastIndexOf("@");
+  if (at <= 0) return user ? `${user[0]}***` : "";
+  return `${user[0]}***${user.slice(at)}`;
+}
+
 const NO_META: RequestMeta = { ip: "", userAgent: "" };
 const ref = (v: Ref): string | null => v ?? null;
 
@@ -118,9 +179,13 @@ function hashInvite(token: string): string {
 
 export class EmailService {
   readonly repo: EmailRepository;
+  private readonly domains: DomainProviderRepository;
   private readonly box: TokenBox;
   private readonly gmail: GmailClient;
   private readonly imap: MailTransport;
+  private readonly createImap: (settings: ImapSmtpSettings) => MailTransport;
+  private readonly lookupMx: (domain: string) => Promise<readonly MxRecord[]>;
+  private readonly connectLimiter = new ConnectLimiter(10, 15 * 60_000);
   private readonly syncing = new Set<string>();
 
   constructor(
@@ -128,15 +193,24 @@ export class EmailService {
     private readonly cfg: EmailConfig,
     private readonly audit: AuditService,
     private readonly timeline: TimelineService,
-    deps: { gmail?: GmailClient; imap?: MailTransport } = {},
+    deps: {
+      gmail?: GmailClient;
+      imap?: MailTransport;
+      createImap?: (settings: ImapSmtpSettings) => MailTransport;
+      /** MX lookup, so tests don't hit DNS. Defaults to a real lookup. */
+      lookupMx?: (domain: string) => Promise<readonly MxRecord[]>;
+    } = {},
   ) {
     this.repo = new EmailRepository(db);
+    this.domains = new DomainProviderRepository(db);
     this.box = new TokenBox(cfg.tokenEncryptionKey || cfg.jwtSecret);
     const redirect = `${cfg.publicApiUrl.replace(/\/+$/, "")}/api/v1/email/google/callback`;
     this.gmail = deps.gmail ?? new GmailClient(cfg.googleClientId, cfg.googleClientSecret, redirect);
+    this.createImap = deps.createImap ?? ((settings) => new ImapSmtpTransport(settings));
+    this.lookupMx = deps.lookupMx ?? lookupMx;
     this.imap =
       deps.imap ??
-      new ImapSmtpTransport({
+      this.createImap({
         imapHost: cfg.mailImapHost ?? "",
         imapPort: cfg.mailImapPort ?? 993,
         imapSecure: cfg.mailImapSecure ?? true,
@@ -155,7 +229,7 @@ export class EmailService {
   }
 
   imapConfigured(): boolean {
-    return (this.cfg.mailImapHost ?? "").trim() !== "" && (this.cfg.mailSmtpHost ?? "").trim() !== "";
+    return true;
   }
 
   private frontSettings(): string {
@@ -172,8 +246,9 @@ export class EmailService {
       pushSyncHealthy: false,
       connectedAccounts: 0,
       needsAttention: 0,
+      companyServer: this.companyServer(),
     };
-    if (!h.configured) return { ...h, message: "Email integration is not configured" };
+    if (!h.oauthConfigured && !h.imapConfigured) return { ...h, message: "Email integration is not configured" };
     try {
       const c = await this.repo.healthCounts();
       h.connectedAccounts = c.connected;
@@ -268,6 +343,9 @@ export class EmailService {
       const token = await this.accessToken(acc).catch(() => "");
       if (token !== "") await this.gmail.stopWatch(token);
     }
+    if (isImapProvider(acc.provider) && !canChangeMailboxSettings(claims, acc) && acc.userId !== claims.userId) {
+      throw AppError.forbidden("Ask the mailbox manager to disconnect, or take over with the mailbox password first");
+    }
     await this.repo.disconnect(acc.id);
     await this.audit.record(claims.userId, "email.disconnected", "email_account", acc.id, { email: acc.emailAddress, provider: acc.provider }, meta);
   }
@@ -291,7 +369,57 @@ export class EmailService {
   }
 
   private mailboxAuth(acc: AccountRecord): MailboxAuth {
-    return { user: acc.emailAddress, pass: this.box.decrypt(acc.encryptedPassword) };
+    const user = (acc.username || "").trim() || acc.emailAddress;
+    return { user, pass: this.box.decrypt(acc.encryptedPassword) };
+  }
+
+  private companyServer(): ImapSmtpSettings | null {
+    const s = this.envImapSettings();
+    return s.imapHost.trim() && s.smtpHost.trim() ? s : null;
+  }
+
+  private envImapSettings(): ImapSmtpSettings {
+    return {
+      imapHost: this.cfg.mailImapHost ?? "",
+      imapPort: this.cfg.mailImapPort ?? 993,
+      imapSecure: this.cfg.mailImapSecure ?? true,
+      smtpHost: this.cfg.mailSmtpHost ?? "",
+      smtpPort: this.cfg.mailSmtpPort ?? 587,
+      smtpSecure: this.cfg.mailSmtpSecure ?? false,
+    };
+  }
+
+  private settingsForAccount(acc: AccountRecord): ImapSmtpSettings {
+    return resolveImapSettings(
+      acc.provider,
+      {
+        imapHost: acc.imapHost,
+        imapPort: acc.imapPort,
+        imapSecure: acc.imapSecure,
+        smtpHost: acc.smtpHost,
+        smtpPort: acc.smtpPort,
+        smtpSecure: acc.smtpSecure,
+      },
+      this.envImapSettings(),
+    );
+  }
+
+  private transportFor(acc: AccountRecord): MailTransport {
+    const settings = this.settingsForAccount(acc);
+    if (!settings.imapHost && !settings.smtpHost) return this.imap;
+    return this.createImap(settings);
+  }
+
+  private hostPolicy() {
+    return {
+      allowPrivate: Boolean(this.cfg.mailAllowPrivateHosts),
+      allowlist: parseHostAllowlist(this.cfg.mailHostAllowlist ?? ""),
+    };
+  }
+
+  private async assertSettingsHosts(settings: ImapSmtpSettings): Promise<void> {
+    await assertMailHostAllowed(settings.imapHost, this.hostPolicy());
+    await assertMailHostAllowed(settings.smtpHost, this.hostPolicy());
   }
 
   private async accessToken(acc: AccountRecord): Promise<string> {
@@ -574,10 +702,20 @@ export class EmailService {
     return { items, total, counts };
   }
 
-  async getThread(claims: Claims, id: string): Promise<{ thread: Thread; messages: Message[] }> {
+  async getThread(claims: Claims, id: string, meta: RequestMeta = NO_META): Promise<{ thread: Thread; messages: Message[] }> {
     const t = await this.repo.getThread(id);
     if (!t) throw AppError.notFound("thread not found");
     assertThreadVisible(claims, t);
+    if (t.ownerUserId !== claims.userId) {
+      await this.audit.record(
+        claims.userId,
+        "email.content_viewed",
+        "email_thread",
+        t.id,
+        { mailboxOwnerUserId: t.ownerUserId, purpose: "team_monitoring" },
+        meta,
+      );
+    }
     return { thread: t, messages: await this.repo.listMessages(t.id) };
   }
 
@@ -818,28 +956,48 @@ export class EmailService {
       fullName: string;
       email: string;
       mailbox: AccountPublic | null;
+      sentToday: number;
+      receivedToday: number;
+      canChangeSettings: boolean;
     }[];
     overview: {
       assigned: number;
       connected: number;
       disconnected: number;
       syncFailures: number;
+      sentToday: number;
+      receivedToday: number;
+      lastSyncAt: Date | null;
     };
   }> {
     const ids = assignedUserIds(claims);
     const people = await this.repo.listAssignedPeople(ids);
     const accounts = await this.repo.listAccountsForUsers(people.map((p) => p.userId));
-    const byUser = new Map(accounts.map((a) => [a.ownerUserId, a]));
-    const rows = people.map((p) => ({
-      userId: p.userId,
-      fullName: p.fullName,
-      email: p.email,
-      mailbox: byUser.get(p.userId) ?? null,
-    }));
+    const byUser = new Map(accounts.map((a) => [a.userId, a]));
+    const today = await this.repo.teamTodayCounts(people.map((p) => p.userId));
+    const rows = people.map((p) => {
+      const mailbox = byUser.get(p.userId) ?? null;
+      const counts = today.get(p.userId) ?? { sent: 0, received: 0 };
+      return {
+        userId: p.userId,
+        fullName: p.fullName,
+        email: p.email,
+        mailbox,
+        sentToday: counts.sent,
+        receivedToday: counts.received,
+        canChangeSettings: mailbox ? canChangeMailboxSettings(claims, mailbox) : canInviteUser(claims, p.userId),
+      };
+    });
     const connected = rows.filter((r) => r.mailbox && r.mailbox.connectionStatus !== "disconnected").length;
     const syncFailures = rows.filter(
       (r) => r.mailbox && (r.mailbox.connectionStatus === "error" || r.mailbox.connectionStatus === "needs_reauth"),
     ).length;
+    const lastSyncAt = rows.reduce<Date | null>((latest, r) => {
+      const at = r.mailbox?.lastSyncAt ?? null;
+      if (!at) return latest;
+      if (!latest || at > latest) return at;
+      return latest;
+    }, null);
     return {
       people: rows,
       overview: {
@@ -847,6 +1005,9 @@ export class EmailService {
         connected,
         disconnected: rows.length - connected,
         syncFailures,
+        sentToday: rows.reduce((n, r) => n + r.sentToday, 0),
+        receivedToday: rows.reduce((n, r) => n + r.receivedToday, 0),
+        lastSyncAt,
       },
     };
   }
@@ -893,24 +1054,291 @@ export class EmailService {
     return { emailAddress: inv.emailAddress, provider: inv.provider, expiresAt: inv.expiresAt };
   }
 
-  async testImapConnection(emailAddress: string, password: string): Promise<{ inbox: string; sent: string }> {
-    if (!this.imapConfigured()) throw AppError.validation("Company mail host is not configured");
-    try {
-      return await this.imap.testConnection({ user: emailAddress.trim(), pass: password });
-    } catch (err) {
-      const safe = safeMailError(err);
-      throw AppError.validation(safe.message);
+  /**
+   * Checks IMAP and SMTP separately with the submitted credentials (never stored ones).
+   * Throws a validation error carrying per-protocol results when either side fails.
+   */
+  private async checkMailbox(
+    prepared: Awaited<ReturnType<EmailService["prepareImapConnect"]>>,
+    requestId: string,
+    action: "test" | "connect",
+  ): Promise<{ folders: { inbox: string; sent: string }; result: MailboxCheckResult }> {
+    const transport = this.createImap(prepared.settings);
+    let check: MailConnectionCheck;
+    if (transport.checkConnection) {
+      check = await transport.checkConnection(prepared.auth);
+    } else {
+      try {
+        check = { imap: { ok: true, ms: 0, folders: await transport.testConnection(prepared.auth) }, smtp: { ok: true, ms: 0 } };
+      } catch (err) {
+        check = { imap: { ok: false, ms: 0, error: classifyMailError(err, "imap") }, smtp: { ok: true, ms: 0 } };
+      }
     }
+    const s = prepared.settings;
+    const result: MailboxCheckResult = {
+      requestId,
+      provider: prepared.provider,
+      providerSource: prepared.providerSource,
+      imap: check.imap.ok
+        ? { ok: true, host: s.imapHost, port: s.imapPort, secure: s.imapSecure }
+        : { ok: false, host: s.imapHost, port: s.imapPort, secure: s.imapSecure, code: check.imap.error.code, message: check.imap.error.message },
+      smtp: check.smtp.ok
+        ? { ok: true, host: s.smtpHost, port: s.smtpPort, secure: s.smtpSecure }
+        : { ok: false, host: s.smtpHost, port: s.smtpPort, secure: s.smtpSecure, code: check.smtp.error.code, message: check.smtp.error.message },
+    };
+    const logBase = {
+      requestId,
+      action,
+      provider: prepared.provider,
+      providerSource: prepared.providerSource,
+      ownerUserId: prepared.ownerId,
+      username: maskMailUser(prepared.auth.user),
+    };
+    for (const stage of ["imap", "smtp"] as const) {
+      const r = check[stage];
+      const host = stage === "imap" ? s.imapHost : s.smtpHost;
+      const port = stage === "imap" ? s.imapPort : s.smtpPort;
+      const secure = stage === "imap" ? s.imapSecure : s.smtpSecure;
+      if (r.ok) {
+        logger.info({ ...logBase, stage, host, port, secure, ms: r.ms }, "mailbox check ok");
+      } else {
+        logger.warn(
+          { ...logBase, stage, host, port, secure, ms: r.ms, code: r.error.code, cause: r.error.diagnostics },
+          "mailbox check failed",
+        );
+      }
+    }
+    if (!check.imap.ok || !check.smtp.ok) {
+      const parts = [
+        check.imap.ok ? null : `IMAP: ${check.imap.error.message}`,
+        check.smtp.ok ? null : `SMTP: ${check.smtp.error.message}`,
+      ].filter(Boolean);
+      throw AppError.validation(parts.join(" "), { mailboxCheck: result, requestId });
+    }
+    return { folders: check.imap.folders, result };
+  }
+
+  async testImapConnection(
+    claims: Claims,
+    in_: ImapConnectFields,
+    requestId = "",
+  ): Promise<{ inbox: string; sent: string; check: MailboxCheckResult }> {
+    this.connectLimiter.check(claims.userId);
+    const prepared = await this.prepareImapConnect(claims, in_);
+    const { folders, result } = await this.checkMailbox(prepared, requestId, "test");
+    return { ...folders, check: result };
   }
 
   async connectImap(
     claims: Claims,
-    in_: { emailAddress: string; password: string; inviteToken?: string },
+    in_: ImapConnectFields,
     meta: RequestMeta,
+    requestId = "",
   ): Promise<AccountPublic> {
-    if (!this.imapConfigured()) throw AppError.validation("Company mail host is not configured");
-    let ownerId = claims.userId;
-    let hinted = in_.emailAddress.trim().toLowerCase();
+    this.connectLimiter.check(`${claims.userId}:connect`);
+    const prepared = await this.prepareImapConnect(claims, in_);
+    const { folders } = await this.checkMailbox(prepared, requestId, "connect");
+    if (in_.inviteToken) {
+      const consumed = await this.repo.consumeInvite(hashInvite(in_.inviteToken));
+      if (!consumed) throw AppError.validation("This connection link is invalid or has expired");
+    }
+    const saved = await this.repo.upsertImapAccount({
+      userId: prepared.ownerId,
+      managerUserId: claims.userId,
+      provider: prepared.provider,
+      emailAddress: prepared.emailAddress,
+      username: prepared.auth.user,
+      displayName: prepared.displayName,
+      encryptedPassword: this.box.encrypt(in_.password),
+      inboxFolder: folders.inbox,
+      sentFolder: folders.sent,
+      imapHost: prepared.settings.imapHost,
+      imapPort: prepared.settings.imapPort,
+      imapSecure: prepared.settings.imapSecure,
+      smtpHost: prepared.settings.smtpHost,
+      smtpPort: prepared.settings.smtpPort,
+      smtpSecure: prepared.settings.smtpSecure,
+    });
+    if (!saved) throw AppError.validation("Could not save the mailbox connection");
+    await this.repo.disconnectOtherImap(prepared.ownerId, saved.id).catch(() => undefined);
+    await this.audit.record(
+      claims.userId,
+      "email.imap_connected",
+      "email_account",
+      saved.id,
+      { email: prepared.emailAddress, provider: prepared.provider, providerSource: prepared.providerSource, ownerUserId: prepared.ownerId },
+      meta,
+    );
+    void this.syncImapAccount(saved).catch((err: unknown) => logger.warn({ err, account: saved.id }, "imap initial sync failed"));
+    return saved;
+  }
+
+  /**
+   * Picks server settings for a mailbox. "auto" (or no provider) uses the admin's domain mapping,
+   * then the domain's public MX records, and only fails when neither identifies a server.
+   * An explicit provider — a TL override — needs email:manage.
+   */
+  private async resolveMailboxServer(
+    claims: Claims,
+    emailAddress: string,
+    in_: ImapConnectFields,
+  ): Promise<{ provider: ImapProviderKind; settings: ImapSmtpSettings; source: ProviderSource; domain: string }> {
+    const domain = domainOfEmail(emailAddress);
+    const mapping = await this.domains.activeForDomain(domain);
+    const requested = (in_.provider ?? "").trim().toLowerCase();
+    if (requested === "" || requested === "auto") {
+      if (mapping) {
+        return { provider: mapping.provider, settings: settingsForDomainProvider(mapping), source: "mapping", domain };
+      }
+      const detected = await this.detectFromMx(claims, domain);
+      if (detected) return { ...detected, domain };
+      throw AppError.fieldValidation(
+        "provider",
+        `Couldn't detect a mail server for @${domain}. Choose Migadu, Spacemail or a custom server, or ask an administrator to add the domain.`,
+      );
+    }
+    if (!expandImplies(claims.permissions).has(P.EmailManage) && claims.roleCode !== "super_admin") {
+      throw AppError.forbidden("Only a team lead or administrator can choose the mail provider");
+    }
+    if (requested === "gmail") throw AppError.fieldValidation("provider", "Connect Gmail with Google sign-in instead");
+    const provider = normalizeImapProvider(requested);
+    const base = provider === "imap" && mapping?.provider === "imap" ? settingsForDomainProvider(mapping) : this.envImapSettings();
+    const settings = resolveImapSettings(
+      provider,
+      {
+        imapHost: in_.imapHost,
+        imapPort: in_.imapPort,
+        imapSecure: in_.imapSecure,
+        smtpHost: in_.smtpHost,
+        smtpPort: in_.smtpPort,
+        smtpSecure: in_.smtpSecure,
+      },
+      base,
+    );
+    const matchesMapping =
+      mapping !== null &&
+      mapping.provider === provider &&
+      JSON.stringify(settingsForDomainProvider(mapping)) === JSON.stringify(settings);
+    return { provider, settings, source: matchesMapping ? "mapping" : "override", domain };
+  }
+
+  /** What a connect form should show for an address. Never includes credentials and does not save anything. */
+  async resolveDomainProvider(emailAddress: string): Promise<{
+    domain: string;
+    mapping: { provider: ImapProviderKind; settings: ImapSmtpSettings; source: "mapping" | "dns" } | null;
+  }> {
+    const domain = domainOfEmail(emailAddress.trim());
+    if (!domain) return { domain: "", mapping: null };
+    const m = await this.domains.activeForDomain(domain);
+    if (m) return { domain, mapping: { provider: m.provider, settings: settingsForDomainProvider(m), source: "mapping" } };
+    const kind = await this.detectedSettings(domain);
+    if (!kind) return { domain, mapping: null };
+    return { domain, mapping: { ...kind, source: "dns" } };
+  }
+
+  /**
+   * MX detection used when connecting. Remembers the domain so the next mailbox skips DNS.
+   * A domain that already has a row (for example one an admin turned off) is left as it is.
+   */
+  private async detectFromMx(
+    claims: Claims,
+    domain: string,
+  ): Promise<{ provider: ImapProviderKind; settings: ImapSmtpSettings; source: "dns" } | null> {
+    const detected = await this.detectedSettings(domain);
+    if (!detected) return null;
+    try {
+      const saved = detected.provider === "imap" ? { domain, provider: detected.provider, ...detected.settings } : { domain, provider: detected.provider };
+      await this.domains.insertIfAbsent(validateDomainProvider(saved), claims.userId);
+    } catch (err) {
+      logger.warn({ err, domain, provider: detected.provider }, "could not remember detected mail domain");
+    }
+    return { ...detected, source: "dns" };
+  }
+
+  /**
+   * Migadu and Spacemail come from their MX hosts. A domain that receives its own mail uses the
+   * company server from the environment when that server belongs to the domain, otherwise the MX host.
+   */
+  private async detectedSettings(
+    domain: string,
+  ): Promise<{ provider: ImapProviderKind; settings: ImapSmtpSettings } | null> {
+    const records = await this.lookupMx(domain);
+    const preset = providerFromMx(records);
+    if (preset) return { provider: preset, settings: { ...IMAP_PRESETS[preset] } };
+    if (!isSelfHostedMx(domain, records)) return null;
+    const company = this.companyServer();
+    if (company && hostServesDomain(company.imapHost, domain) && hostServesDomain(company.smtpHost, domain)) {
+      return { provider: "imap", settings: company };
+    }
+    const host = primaryMxHost(records);
+    return {
+      provider: "imap",
+      settings: { imapHost: host, imapPort: 993, imapSecure: true, smtpHost: host, smtpPort: 465, smtpSecure: true },
+    };
+  }
+
+  /**
+   * Domain mappings apply company-wide. TLs hold email:manage, which implies a team-scoped
+   * email:configure, so the route guard alone would let them edit; require organization scope.
+   */
+  private assertMappingAdmin(claims: Claims): void {
+    if (claims.roleCode === Role.SuperAdmin) return;
+    if (claims.permissionScopes[P.EmailConfigure] === "organization") return;
+    throw AppError.forbidden("Only an administrator can manage mail domains");
+  }
+
+  listDomainProviders(claims: Claims): Promise<DomainProvider[]> {
+    this.assertMappingAdmin(claims);
+    return this.domains.list();
+  }
+
+  async createDomainProvider(claims: Claims, in_: DomainProviderInput, meta: RequestMeta): Promise<DomainProvider> {
+    this.assertMappingAdmin(claims);
+    const v = validateDomainProvider(in_);
+    if (v.provider === "imap") await this.assertSettingsHosts(settingsForDomainProvider(v));
+    const saved = await this.domains.insert(v, claims.userId);
+    await this.audit.record(claims.userId, "email.domain_provider_created", "email_domain_provider", saved.id, { domain: saved.domain, provider: saved.provider }, meta);
+    return saved;
+  }
+
+  async updateDomainProvider(claims: Claims, id: string, in_: DomainProviderInput, meta: RequestMeta): Promise<DomainProvider> {
+    this.assertMappingAdmin(claims);
+    const v = validateDomainProvider(in_);
+    if (v.provider === "imap") await this.assertSettingsHosts(settingsForDomainProvider(v));
+    const saved = await this.domains.update(id, v, claims.userId);
+    if (!saved) throw AppError.notFound("domain provider not found");
+    await this.audit.record(
+      claims.userId,
+      "email.domain_provider_updated",
+      "email_domain_provider",
+      saved.id,
+      { domain: saved.domain, provider: saved.provider, isActive: saved.isActive },
+      meta,
+    );
+    return saved;
+  }
+
+  async deleteDomainProvider(claims: Claims, id: string, meta: RequestMeta): Promise<void> {
+    this.assertMappingAdmin(claims);
+    const removed = await this.domains.delete(id);
+    if (!removed) throw AppError.notFound("domain provider not found");
+    await this.audit.record(claims.userId, "email.domain_provider_deleted", "email_domain_provider", id, { domain: removed.domain, provider: removed.provider }, meta);
+  }
+
+  private async prepareImapConnect(
+    claims: Claims,
+    in_: ImapConnectFields,
+  ): Promise<{
+    ownerId: string;
+    provider: string;
+    providerSource: ProviderSource;
+    emailAddress: string;
+    displayName: string;
+    settings: ImapSmtpSettings;
+    auth: MailboxAuth;
+  }> {
+    let ownerId = in_.ownerUserId?.trim() || claims.userId;
+    let hinted = (in_.emailAddress ?? "").trim().toLowerCase();
     if (in_.inviteToken) {
       const inv = await this.repo.peekInvite(hashInvite(in_.inviteToken));
       if (!inv) throw AppError.validation("This connection link is invalid or has expired");
@@ -918,32 +1346,26 @@ export class EmailService {
       ownerId = inv.invitedUserId;
       if (!hinted) hinted = inv.emailAddress.trim().toLowerCase();
     }
+    if (ownerId !== claims.userId && !canInviteUser(claims, ownerId)) {
+      throw AppError.forbidden("you can only connect mailboxes for assigned team members");
+    }
     if (!hinted || !hinted.includes("@")) throw AppError.validation("Enter a valid email address");
     if (!in_.password) throw AppError.validation("Mailbox password is required");
-    let folders;
-    try {
-      folders = await this.imap.testConnection({ user: hinted, pass: in_.password });
-    } catch (err) {
-      const safe = safeMailError(err);
-      logger.warn({ code: safe.code, accountEmail: hinted }, "imap connect failed");
-      throw AppError.validation(safe.message);
+    const { provider, settings, source } = await this.resolveMailboxServer(claims, hinted, in_);
+    if (!settings.imapHost || !settings.smtpHost) {
+      throw AppError.validation("IMAP and SMTP hosts are required");
     }
-    if (in_.inviteToken) {
-      const consumed = await this.repo.consumeInvite(hashInvite(in_.inviteToken));
-      if (!consumed) throw AppError.validation("This connection link is invalid or has expired");
-    }
-    const saved = await this.repo.upsertImapAccount({
-      userId: ownerId,
+    await this.assertSettingsHosts(settings);
+    const username = (in_.username ?? "").trim() || hinted;
+    return {
+      ownerId,
+      provider,
+      providerSource: source,
       emailAddress: hinted,
-      displayName: claims.fullName || hinted,
-      encryptedPassword: this.box.encrypt(in_.password),
-      inboxFolder: folders.inbox,
-      sentFolder: folders.sent,
-    });
-    if (!saved) throw AppError.validation("Could not save the mailbox connection");
-    await this.audit.record(claims.userId, "email.imap_connected", "email_account", saved.id, { email: hinted }, meta);
-    void this.syncImapAccount(saved).catch((err: unknown) => logger.warn({ err, account: saved.id }, "imap initial sync failed"));
-    return saved;
+      displayName: hinted,
+      settings,
+      auth: { user: username, pass: in_.password },
+    };
   }
 
   private async sendImap(
@@ -955,7 +1377,7 @@ export class EmailService {
   ): Promise<Message | null> {
     let sent;
     try {
-      sent = await this.imap.send(this.mailboxAuth(acc), {
+      sent = await this.transportFor(acc).send(this.mailboxAuth(acc), {
         fromName: acc.displayName,
         fromAddress: acc.emailAddress,
         to: m.toAddresses,
@@ -965,10 +1387,11 @@ export class EmailService {
         html: m.bodyHtml,
         text: m.bodyText || stripTags(m.bodyHtml),
         inReplyTo: m.inReplyTo ?? undefined,
+        sentFolder: acc.imapSentFolder || undefined,
       });
     } catch (err) {
-      const safe = safeMailError(err);
-      logger.warn({ code: safe.code, account: acc.id }, "imap send failed");
+      const safe = classifyMailError(err);
+      logger.warn({ code: safe.code, stage: safe.stage, account: acc.id, cause: safe.diagnostics }, "imap send failed");
       m.status = "failed";
       await this.repo.updateMessage(m).catch(() => undefined);
       await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: safe.code }, meta);
@@ -1004,22 +1427,23 @@ export class EmailService {
         await this.repo.updateSync(acc.id, "needs_reauth", "", "Reconnect your company mailbox");
         return;
       }
+      const transport = this.transportFor(acc);
       let inbox = acc.imapInboxFolder;
       let sent = acc.imapSentFolder;
       if (!inbox || !sent) {
-        const folders = await this.imap.testConnection(auth);
+        const folders = await transport.testConnection(auth);
         inbox = inbox || folders.inbox;
         sent = sent || folders.sent;
       }
-      await this.syncImapFolder(acc, auth, "inbox", inbox, Number(acc.imapInboxUidValidity) || 0, Number(acc.imapInboxUid) || 0);
+      await this.syncImapFolder(acc, auth, transport, "inbox", inbox, Number(acc.imapInboxUidValidity) || 0, Number(acc.imapInboxUid) || 0);
       const fresh = await this.repo.getAccount(acc.id);
       if (fresh) {
-        await this.syncImapFolder(fresh, auth, "sent", sent, Number(fresh.imapSentUidValidity) || 0, Number(fresh.imapSentUid) || 0);
+        await this.syncImapFolder(fresh, auth, transport, "sent", sent, Number(fresh.imapSentUidValidity) || 0, Number(fresh.imapSentUid) || 0);
       }
       await this.repo.updateSync(acc.id, "connected", "", sent ? "" : "Sent folder was not found. Thunderbird sent mail may not appear until it exists.");
     } catch (err) {
-      const safe = safeMailError(err);
-      logger.warn({ code: safe.code, account: acc.id }, "imap sync failed");
+      const safe = classifyMailError(err);
+      logger.warn({ code: safe.code, stage: safe.stage, account: acc.id, cause: safe.diagnostics }, "imap sync failed");
       const status = safe.code === "auth" ? "needs_reauth" : "error";
       await this.repo.updateSync(acc.id, status, "", safe.message).catch(() => undefined);
     } finally {
@@ -1030,6 +1454,7 @@ export class EmailService {
   private async syncImapFolder(
     acc: AccountRecord,
     auth: MailboxAuth,
+    transport: MailTransport,
     folder: "inbox" | "sent",
     path: string,
     uidValidity: number,
@@ -1038,7 +1463,7 @@ export class EmailService {
     if (!path) return;
     let cursor = { uidValidity, uid };
     for (let batch = 0; batch < 8; batch++) {
-      const fetched = await this.imap.fetchFolder(auth, folder, path, cursor);
+      const fetched = await transport.fetchFolder(auth, folder, path, cursor);
       for (const msg of fetched.messages) {
         await this.ingestFetched(acc, msg).catch((err: unknown) => logger.warn({ err, id: msg.providerMessageId }, "imap ingest failed"));
       }

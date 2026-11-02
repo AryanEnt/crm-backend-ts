@@ -5,9 +5,11 @@ import { simpleParser } from "mailparser";
 import { parseAddress, parseAddressList } from "./mime.js";
 import {
   MailProviderError,
+  classifyMailError,
   type DiscoveredFolders,
   type FetchedMail,
   type FolderCursor,
+  type MailConnectionCheck,
   type MailFolderKind,
   type MailTransport,
   type MailboxAuth,
@@ -27,42 +29,51 @@ export type ImapSmtpSettings = {
 };
 
 const FETCH_BATCH = 40;
+const CONNECT_TIMEOUT_MS = 20_000;
+const GREETING_TIMEOUT_MS = 15_000;
 
 function imapClient(settings: ImapSmtpSettings, auth: MailboxAuth) {
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: settings.imapHost,
     port: settings.imapPort,
+    // true = implicit TLS from the first byte (993); false = plain then STARTTLS (143).
     secure: settings.imapSecure,
+    servername: settings.imapHost,
     auth: { user: auth.user, pass: auth.pass },
     tls: { rejectUnauthorized: true },
+    connectionTimeout: CONNECT_TIMEOUT_MS,
+    greetingTimeout: GREETING_TIMEOUT_MS,
     logger: false,
   });
+  // ImapFlow re-emits socket failures as "error"; without a listener Node treats them as fatal.
+  client.on("error", () => undefined);
+  return client;
+}
+
+/** Logs out a connected client, or tears down the socket when login never completed. */
+async function closeImap(client: ImapFlow): Promise<void> {
+  if (client.usable) {
+    await client.logout().catch(() => client.close());
+  } else {
+    client.close();
+  }
 }
 
 function smtpTransport(settings: ImapSmtpSettings, auth: MailboxAuth) {
   return nodemailer.createTransport({
     host: settings.smtpHost,
     port: settings.smtpPort,
+    // true = implicit TLS (465); false = STARTTLS upgrade when the server offers it (587).
     secure: settings.smtpSecure,
     auth: { user: auth.user, pass: auth.pass },
-    tls: { rejectUnauthorized: true },
+    tls: { rejectUnauthorized: true, servername: settings.smtpHost },
+    connectionTimeout: CONNECT_TIMEOUT_MS,
+    greetingTimeout: GREETING_TIMEOUT_MS,
+    socketTimeout: 60_000,
   });
 }
 
-function classify(err: unknown): MailProviderError {
-  const raw = err instanceof Error ? err.message : "Mail server error";
-  const lower = raw.toLowerCase();
-  if (lower.includes("auth") || lower.includes("login") || lower.includes("credentials")) {
-    return new MailProviderError("Mailbox username or password was rejected.", "auth");
-  }
-  if (lower.includes("certificate") || lower.includes("self signed") || lower.includes("unable to verify")) {
-    return new MailProviderError("Could not verify the mail server’s security certificate.", "tls");
-  }
-  if (lower.includes("econnrefused") || lower.includes("timeout") || lower.includes("enotfound")) {
-    return new MailProviderError("Could not reach the mail server. Check host and port.", "network");
-  }
-  return new MailProviderError("Could not complete the mail operation. Try again.", "unknown");
-}
+const classify = classifyMailError;
 
 export function pickFolders(boxes: { path: string; specialUse?: string; name?: string; listed?: boolean }[]): DiscoveredFolders {
   let inbox = "";
@@ -112,27 +123,76 @@ export class ImapSmtpTransport implements MailTransport {
     return { kind: "imap", send: true, syncInbox: true, syncSent: true, idle: false };
   }
 
-  async testConnection(auth: MailboxAuth): Promise<DiscoveredFolders> {
+  async testImap(auth: MailboxAuth): Promise<DiscoveredFolders> {
     if (!this.settings.imapHost.trim()) {
-      throw new MailProviderError("Company mail host is not configured.", "network");
+      throw new MailProviderError("IMAP host is not configured.", "network", { stage: "imap" });
     }
     const client = imapClient(this.settings, auth);
     try {
       await client.connect();
+    } catch (err) {
+      await closeImap(client);
+      throw classify(err, "imap");
+    }
+    try {
       const listed = await client.list();
       const folders = pickFolders(listed);
-      await client.mailboxOpen(folders.inbox);
+      try {
+        await client.mailboxOpen(folders.inbox);
+      } catch (err) {
+        const e = classify(err, "imap");
+        throw e.code === "reject"
+          ? new MailProviderError(`Signed in, but the inbox (${folders.inbox}) could not be opened.`, "reject", { cause: err, stage: "imap" })
+          : e;
+      }
       return folders;
     } catch (err) {
-      throw classify(err);
+      throw classify(err, "imap");
     } finally {
-      await client.logout().catch(() => undefined);
+      await closeImap(client);
     }
+  }
+
+  async testSmtp(auth: MailboxAuth): Promise<void> {
+    if (!this.settings.smtpHost.trim()) {
+      throw new MailProviderError("SMTP host is not configured.", "network", { stage: "smtp" });
+    }
+    const transport = smtpTransport(this.settings, auth);
+    try {
+      await transport.verify();
+    } catch (err) {
+      throw classify(err, "smtp");
+    } finally {
+      transport.close();
+    }
+  }
+
+  /** Runs IMAP and SMTP independently so one failing never hides the other's result. */
+  async checkConnection(auth: MailboxAuth): Promise<MailConnectionCheck> {
+    const timed = async <T>(fn: () => Promise<T>) => {
+      const started = Date.now();
+      try {
+        return { ok: true as const, value: await fn(), ms: Date.now() - started };
+      } catch (err) {
+        return { ok: false as const, error: classify(err), ms: Date.now() - started };
+      }
+    };
+    const [imap, smtp] = await Promise.all([timed(() => this.testImap(auth)), timed(() => this.testSmtp(auth))]);
+    return {
+      imap: imap.ok ? { ok: true, ms: imap.ms, folders: imap.value } : { ok: false, ms: imap.ms, error: imap.error },
+      smtp: smtp.ok ? { ok: true, ms: smtp.ms } : { ok: false, ms: smtp.ms, error: smtp.error },
+    };
+  }
+
+  async testConnection(auth: MailboxAuth): Promise<DiscoveredFolders> {
+    const folders = await this.testImap(auth);
+    await this.testSmtp(auth);
+    return folders;
   }
 
   async send(auth: MailboxAuth, mail: SendMailInput): Promise<SendMailResult> {
     if (!this.settings.smtpHost.trim()) {
-      throw new MailProviderError("Company SMTP host is not configured.", "network");
+      throw new MailProviderError("SMTP host is not configured.", "network");
     }
     const transport = smtpTransport(this.settings, auth);
     try {
@@ -148,11 +208,31 @@ export class ImapSmtpTransport implements MailTransport {
         envelope: { from: mail.fromAddress, to: [...mail.to, ...mail.cc, ...mail.bcc] },
       });
       const providerMessageId = String(info.messageId || "").trim() || `smtp:${Date.now()}`;
+      if (mail.sentFolder) {
+        await this.appendSent(auth, mail, providerMessageId, mail.sentFolder).catch(() => undefined);
+      }
       return { providerMessageId, providerThreadId: threadIdOf({ messageId: providerMessageId }, providerMessageId) };
     } catch (err) {
-      throw classify(err);
+      throw classify(err, "smtp");
     } finally {
       transport.close();
+    }
+  }
+
+  private async appendSent(auth: MailboxAuth, mail: SendMailInput, messageId: string, path: string): Promise<void> {
+    const from = mail.fromName ? `"${mail.fromName.replace(/"/g, "")}" <${mail.fromAddress}>` : mail.fromAddress;
+    let raw = `From: ${from}\r\nTo: ${mail.to.join(", ")}\r\n`;
+    if (mail.cc.length) raw += `Cc: ${mail.cc.join(", ")}\r\n`;
+    raw += `Subject: ${mail.subject}\r\nMessage-ID: ${messageId}\r\nMIME-Version: 1.0\r\n`;
+    raw += mail.html
+      ? `Content-Type: text/html; charset=UTF-8\r\n\r\n${mail.html}`
+      : `Content-Type: text/plain; charset=UTF-8\r\n\r\n${mail.text}`;
+    const client = imapClient(this.settings, auth);
+    try {
+      await client.connect();
+      await client.append(path, Buffer.from(raw), ["\\Seen"]);
+    } finally {
+      await closeImap(client);
     }
   }
 
@@ -219,9 +299,9 @@ export class ImapSmtpTransport implements MailTransport {
         lock.release();
       }
     } catch (err) {
-      throw classify(err);
+      throw classify(err, "imap");
     } finally {
-      await client.logout().catch(() => undefined);
+      await closeImap(client);
     }
   }
 }

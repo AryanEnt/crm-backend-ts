@@ -30,11 +30,16 @@ async function main(): Promise<void> {
   } catch (err) {
     throw new Error(`load config: ${message(err)}`);
   }
-  const pool = createPool(config.databaseUrl);
+  const pool = createPool(config.databaseUrl, config.databasePoolMax);
+  const workerPool = createPool(config.databaseUrl, config.workerPoolMax);
   const db = createDatabase(pool);
+  const workerDb = createDatabase(workerPool);
 
   await ping(db, 5_000).catch((err: unknown) => {
     throw new Error(`connect database: ${message(err)}`);
+  });
+  await ping(workerDb, 5_000).catch((err: unknown) => {
+    throw new Error(`connect worker database: ${message(err)}`);
   });
 
   // Like the Go entrypoint: apply pending migrations and seed the bootstrap admin on every start.
@@ -46,11 +51,14 @@ async function main(): Promise<void> {
     throw new Error(`seed bootstrap admin: ${message(err)}`);
   });
 
-  const worker = config.automationWorker ? createAutomationWorker(db) : null;
+  const worker = config.automationWorker ? createAutomationWorker(workerDb) : null;
   const emailWorker = config.emailWorker
-    ? createEmailWorker(new EmailService(db, config, new AuditService(db), new TimelineService(db)), config.mailSyncIntervalMs)
+    ? createEmailWorker(
+        new EmailService(workerDb, config, new AuditService(workerDb), new TimelineService(workerDb)),
+        config.mailSyncIntervalMs,
+      )
     : null;
-  const slaWorker = createSlaNotificationWorker(db);
+  const slaWorker = createSlaNotificationWorker(workerDb);
   const app = createApp({ config, db, automationWake: worker?.wake });
   const server = app.listen(config.port, () => {
     logger.info(
@@ -61,6 +69,8 @@ async function main(): Promise<void> {
         go_backend_url: config.goBackendUrl || null,
         automation_worker: config.automationWorker,
         email_worker: config.emailWorker,
+        database_pool_max: config.databasePoolMax,
+        worker_pool_max: config.workerPoolMax,
       },
       "API server listening",
     );
@@ -87,6 +97,7 @@ async function main(): Promise<void> {
       await emailWorker?.stop();
       await slaWorker.stop();
       await db.destroy().catch(() => undefined);
+      await workerDb.destroy().catch(() => undefined);
       logger.info("server stopped cleanly");
       process.exit(0);
     });

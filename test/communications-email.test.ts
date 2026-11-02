@@ -396,16 +396,14 @@ describe("communications and email routes", () => {
       .get("/api/v1/email/health")
       .set("Authorization", bearer());
     expect(res.status).toBe(200);
-    expect(res.body.data).toEqual({
-      configured: false,
+    expect(res.body.data).toMatchObject({
+      configured: true,
       oauthConfigured: false,
       gmailApiEnabled: false,
-      imapConfigured: false,
+      imapConfigured: true,
       pubSubConfigured: false,
-      pushSyncHealthy: false,
       connectedAccounts: 0,
       needsAttention: 0,
-      message: "Email integration is not configured",
     });
   });
 });

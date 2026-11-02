@@ -11,11 +11,11 @@ pg.types.setTypeParser(pg.types.builtins.DATE, (v) => v);
 
 export type Database = Kysely<DB>;
 
-/** Pool sizing mirrors the Go backend's pgxpool settings. */
-export function createPool(databaseUrl: string): pg.Pool {
+/** HTTP traffic and background workers get separate pools so a mailbox sync cannot take every connection. */
+export function createPool(databaseUrl: string, max = 20): pg.Pool {
   return new pg.Pool({
     connectionString: databaseUrl,
-    max: 20,
+    max,
     idleTimeoutMillis: 60_000,
     maxLifetimeSeconds: 60 * 60,
     connectionTimeoutMillis: 10_000,

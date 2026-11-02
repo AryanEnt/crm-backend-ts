@@ -17,6 +17,16 @@ export function canManageMailbox(claims: Claims, acc: AccountRecord): boolean {
   return false;
 }
 
+/** Disconnect, replace password, edit IMAP/SMTP — current manager, org admin, or legacy unowned mailbox. */
+export function canChangeMailboxSettings(claims: Claims, acc: AccountRecord): boolean {
+  if (claims.roleCode === Role.SuperAdmin) return true;
+  const scope = scopeFor(claims.permissionScopes, P.EmailManage);
+  if (scope === "organization") return true;
+  if (acc.managerUserId && acc.managerUserId === claims.userId) return true;
+  if (!acc.managerUserId && canInviteUser(claims, acc.userId)) return true;
+  return false;
+}
+
 export function assignedUserIds(claims: Claims): string[] {
   const ids = new Set<string>([claims.userId, ...claims.teamMemberUserIds]);
   return [...ids];

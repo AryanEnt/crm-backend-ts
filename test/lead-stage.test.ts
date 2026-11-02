@@ -323,7 +323,7 @@ describe("LeadStageService.move", () => {
 
 describe("LeadStageService.board", () => {
   const scope = { unscoped: true, ownerIds: [], teamIds: [] };
-  const filter = { pipelineId: PIPE, search: "", ownerUserId: "", priority: "", source: "", tag: "", activity: "", scope, limit: 1 };
+  const filter = { pipelineId: PIPE, search: "", ownerUserId: "", priority: "", source: "", tag: "", country: "", activity: "", scope, limit: 1 };
   const card = (id: string, stageId: string) => ({ id, stageId, fullName: id, potentialValue: 100, tags: [] });
 
   it("groups capped cards under active stages with per-stage totals", async () => {

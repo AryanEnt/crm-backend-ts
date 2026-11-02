@@ -3,6 +3,10 @@ export interface Config {
   appEnv: string;
   port: number;
   databaseUrl: string;
+  /** Connections reserved for API requests. */
+  databasePoolMax: number;
+  /** Connections reserved for email, automation, and SLA workers. */
+  workerPoolMax: number;
   jwtSecret: string;
   /** Primary origin (first FRONTEND_URL entry), used for redirects. */
   frontendUrl: string;
@@ -26,6 +30,9 @@ export interface Config {
   mailSmtpPort: number;
   mailSmtpSecure: boolean;
   mailSyncIntervalMs: number;
+  /** Comma-separated IMAP/SMTP hostnames allowed for custom mailboxes. Empty allows any public host. */
+  mailHostAllowlist: string;
+  mailAllowPrivateHosts: boolean;
   tokenEncryptionKey: string;
   /** Meta app for WhatsApp Embedded Signup (SE one-click connect). */
   metaAppId: string;
@@ -82,6 +89,8 @@ export function loadConfig(): Config {
     appEnv: env("APP_ENV", "development"),
     port,
     databaseUrl,
+    databasePoolMax: parsePoolSize("DATABASE_POOL_MAX", 20),
+    workerPoolMax: parsePoolSize("WORKER_POOL_MAX", 5),
     jwtSecret,
     frontendUrl: primaryFrontendUrl(frontendRaw),
     corsOrigins: frontendRaw,
@@ -102,7 +111,9 @@ export function loadConfig(): Config {
     mailSmtpHost: env("MAIL_SMTP_HOST", env("MAIL_IMAP_HOST", "mail.entegrasources.com.np")),
     mailSmtpPort: Number(env("MAIL_SMTP_PORT", "587")) || 587,
     mailSmtpSecure: parseFlag("MAIL_SMTP_SECURE", false),
-    mailSyncIntervalMs: Number(env("MAIL_SYNC_INTERVAL_MS", "300000")) || 300_000,
+    mailSyncIntervalMs: Number(env("MAIL_SYNC_INTERVAL_MS")) || Number(env("EMAIL_SYNC_INTERVAL_SECONDS", "0")) * 1000 || 300_000,
+    mailHostAllowlist: env("MAIL_HOST_ALLOWLIST"),
+    mailAllowPrivateHosts: parseFlag("MAIL_ALLOW_PRIVATE_HOSTS", env("APP_ENV", "development") !== "production"),
     tokenEncryptionKey: env("TOKEN_ENCRYPTION_KEY", jwtSecret),
     metaAppId: env("META_APP_ID"),
     metaAppSecret: env("META_APP_SECRET"),
@@ -113,6 +124,16 @@ export function loadConfig(): Config {
     automationWorker: parseFlag("AUTOMATION_WORKER", env("GO_BACKEND_URL") === ""),
     emailWorker: parseFlag("EMAIL_WORKER", env("GO_BACKEND_URL") === ""),
   };
+}
+
+function parsePoolSize(key: string, fallback: number): number {
+  const raw = env(key).trim();
+  if (raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 50) {
+    throw new Error(`${key} must be an integer from 1 to 50`);
+  }
+  return n;
 }
 
 function parseFlag(key: string, fallback: boolean): boolean {

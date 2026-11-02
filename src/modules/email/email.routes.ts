@@ -3,6 +3,7 @@ import { z } from "zod";
 import { atoi, queryParam } from "../../lib/query.js";
 import { readBody } from "../../lib/raw-body.js";
 import { pathParam, requestMetaFirstHopWithPort } from "../../lib/request-meta.js";
+import { AppError } from "../../lib/app-error.js";
 import { created, ok } from "../../lib/response.js";
 import { createRouter } from "../../lib/router.js";
 import { bool, decodeJson, optionalBool, optionalString, str, stringArray } from "../../lib/validate.js";
@@ -112,6 +113,9 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
         fullName: p.fullName,
         email: p.email,
         mailbox: p.mailbox ? accountJson(p.mailbox) : null,
+        sentToday: p.sentToday,
+        receivedToday: p.receivedToday,
+        canChangeSettings: p.canChangeSettings,
       })),
     });
   });
@@ -142,27 +146,95 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
     ok(res, { invite: inv });
   });
 
+  const optionalInt = z.number().int().optional();
   const imapConnectSchema = z.strictObject({
+    ownerUserId: optionalString(),
+    provider: optionalString(),
     emailAddress: str(),
+    username: optionalString(),
     password: str(),
     inviteToken: optionalString(),
+    imapHost: optionalString(),
+    imapPort: optionalInt,
+    imapSecure: optionalBool(),
+    smtpHost: optionalString(),
+    smtpPort: optionalInt,
+    smtpSecure: optionalBool(),
   });
 
-  router.post("/api/v1/email/imap/test", ...guard(P.EmailSend, P.EmailView), jsonBody, async (req, res) => {
-    const in_ = decodeJson(req, imapConnectSchema);
-    const folders = await service.testImapConnection(in_.emailAddress, in_.password);
-    ok(res, { ok: true, inbox: folders.inbox, sent: folders.sent || null });
+  const testResponse = (r: Awaited<ReturnType<EmailService["testImapConnection"]>>) => ({
+    ok: true,
+    inbox: r.inbox,
+    sent: r.sent || null,
+    requestId: r.check.requestId,
+    provider: r.check.provider,
+    providerSource: r.check.providerSource,
+    imap: r.check.imap,
+    smtp: r.check.smtp,
   });
 
-  router.post("/api/v1/email/imap/connect", ...guard(P.EmailSend, P.EmailView), jsonBody, async (req, res) => {
+  router.post("/api/v1/email/imap/test", ...guard(P.EmailSend, P.EmailView, P.EmailManage), jsonBody, async (req, res) => {
     const in_ = decodeJson(req, imapConnectSchema);
-    const acc = await service.connectImap(
-      claimsOf(req),
-      { emailAddress: in_.emailAddress, password: in_.password, inviteToken: in_.inviteToken },
-      requestMetaFirstHopWithPort(req),
-    );
+    ok(res, testResponse(await service.testImapConnection(claimsOf(req), in_, req.requestId)));
+  });
+
+  router.post("/api/v1/email/imap/connect", ...guard(P.EmailManage, P.EmailSend, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, imapConnectSchema);
+    const acc = await service.connectImap(claimsOf(req), in_, requestMetaFirstHopWithPort(req), req.requestId);
     created(res, accountJson(acc));
   });
+
+  router.post("/api/v1/email/team/mailboxes", ...guard(P.EmailManage, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, imapConnectSchema);
+    if (!(in_.ownerUserId ?? "").trim()) throw AppError.validation("Select a sales executive");
+    const acc = await service.connectImap(claimsOf(req), in_, requestMetaFirstHopWithPort(req), req.requestId);
+    created(res, accountJson(acc));
+  });
+
+  router.post("/api/v1/email/team/mailboxes/test", ...guard(P.EmailManage, P.EmailView), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, imapConnectSchema);
+    ok(res, testResponse(await service.testImapConnection(claimsOf(req), in_, req.requestId)));
+  });
+
+  const domainProviderSchema = z.strictObject({
+    domain: str(),
+    provider: str(),
+    imapHost: optionalString(),
+    imapPort: optionalInt,
+    imapSecure: optionalBool(),
+    smtpHost: optionalString(),
+    smtpPort: optionalInt,
+    smtpSecure: optionalBool(),
+    isActive: optionalBool(),
+  });
+
+  router.get("/api/v1/email/domain-providers", ...guard(P.EmailConfigure), async (req, res) => {
+    ok(res, { items: await service.listDomainProviders(claimsOf(req)) });
+  });
+
+  router.post("/api/v1/email/domain-providers", ...guard(P.EmailConfigure), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, domainProviderSchema);
+    created(res, await service.createDomainProvider(claimsOf(req), in_, requestMetaFirstHopWithPort(req)));
+  });
+
+  router.put("/api/v1/email/domain-providers/:id", ...guard(P.EmailConfigure), jsonBody, async (req, res) => {
+    const in_ = decodeJson(req, domainProviderSchema);
+    ok(res, await service.updateDomainProvider(claimsOf(req), pathParam(req, "id"), in_, requestMetaFirstHopWithPort(req)));
+  });
+
+  router.delete("/api/v1/email/domain-providers/:id", ...guard(P.EmailConfigure), async (req, res) => {
+    await service.deleteDomainProvider(claimsOf(req), pathParam(req, "id"), requestMetaFirstHopWithPort(req));
+    ok(res, { deleted: true });
+  });
+
+  /** Which provider an address maps to, so connect forms can pre-select it. */
+  router.get(
+    "/api/v1/email/domain-providers/resolve",
+    ...guard(P.EmailManage, P.EmailSend, P.EmailConfigure),
+    async (req, res) => {
+      ok(res, await service.resolveDomainProvider(queryParam(req, "email")));
+    },
+  );
 
   router.post("/api/v1/email/google/connect", ...guard(P.EmailSend, P.EmailView), async (req, res) => {
     const redirectTo = await lenientRedirectTo(req);
@@ -212,7 +284,7 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
   });
 
   router.get("/api/v1/email/threads/:id", ...guard(P.EmailView), async (req, res) => {
-    const d = await service.getThread(claimsOf(req), pathParam(req, "id"));
+    const d = await service.getThread(claimsOf(req), pathParam(req, "id"), requestMetaFirstHopWithPort(req));
     ok(res, { thread: threadJson(d.thread), messages: d.messages.map(messageJson) });
   });
 

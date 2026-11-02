@@ -360,16 +360,31 @@ export interface EmailAccounts {
   email_address: string;
   encrypted_access_token: Generated<string>;
   encrypted_refresh_token: Generated<string>;
+  encrypted_password?: Generated<string>;
   gmail_history_id: Generated<string>;
   id: Generated<string>;
+  imap_host?: Generated<string>;
+  imap_inbox_folder?: Generated<string>;
+  imap_inbox_uid?: Generated<number>;
+  imap_inbox_uidvalidity?: Generated<number>;
+  imap_port?: Generated<number>;
+  imap_secure?: Generated<boolean>;
+  imap_sent_folder?: Generated<string>;
+  imap_sent_uid?: Generated<number>;
+  imap_sent_uidvalidity?: Generated<number>;
   last_sync_at: Timestamp | null;
   last_sync_error: Generated<string>;
+  manager_user_id?: string | null;
   provider: Generated<string>;
   receiving_enabled: Generated<boolean>;
   sending_enabled: Generated<boolean>;
+  smtp_host?: Generated<string>;
+  smtp_port?: Generated<number>;
+  smtp_secure?: Generated<boolean>;
   token_expiry: Timestamp | null;
   updated_at: Generated<Timestamp>;
   user_id: string;
+  username?: Generated<string>;
   watch_expiration: Timestamp | null;
 }
 
