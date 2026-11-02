@@ -370,7 +370,17 @@ export class EmailService {
 
   private mailboxAuth(acc: AccountRecord): MailboxAuth {
     const user = (acc.username || "").trim() || acc.emailAddress;
-    return { user, pass: this.box.decrypt(acc.encryptedPassword) };
+    try {
+      return { user, pass: this.box.decrypt(acc.encryptedPassword) };
+    } catch (err) {
+      logger.warn(
+        { account: acc.id, error: err instanceof Error ? err.message : String(err) },
+        "mailbox password decrypt failed — check TOKEN_ENCRYPTION_KEY matches the key used when connecting",
+      );
+      throw AppError.validation(
+        "Could not unlock the mailbox password. Ask your Team Lead to reconnect it in Team Email (server encryption key may have changed).",
+      );
+    }
   }
 
   private companyServer(): ImapSmtpSettings | null {
@@ -526,7 +536,7 @@ export class EmailService {
   }
 
   private async syncAccount(acc: AccountRecord): Promise<void> {
-    if (acc.provider === "imap") {
+    if (isImapProvider(acc.provider)) {
       await this.syncImapAccount(acc);
       return;
     }
@@ -831,7 +841,7 @@ export class EmailService {
     if (m.ownerUserId !== claims.userId) throw AppError.forbidden("cannot send this message");
     const acc = await this.requireOwnAccount(claims, m.accountId);
     const thread = await this.repo.getThread(m.threadId);
-    if (!thread) throw new Error("thread not found for message");
+    if (!thread) throw AppError.notFound("thread not found");
     const preview = await this.preview(m.subject, m.bodyHtml, m.bodyText, thread.leadId, thread.customerId);
     if (!preview.canSend) throw AppError.validation("Email still contains unresolved variables");
     m.subject = preview.subject;
@@ -844,7 +854,8 @@ export class EmailService {
     if (m.toAddresses.length === 0) throw AppError.validation("Add at least one recipient");
     m.fromAddress = acc.emailAddress;
     m.fromName = acc.displayName;
-    if (acc.provider === "imap") return this.sendImap(actorId, acc, thread, m, meta);
+    // migadu / spacemail / custom imap all use SMTP — not Gmail OAuth
+    if (isImapProvider(acc.provider)) return this.sendImap(actorId, acc, thread, m, meta);
     let token: string;
     try {
       token = await this.accessToken(acc);
