@@ -77,6 +77,38 @@ function isDeliveredFileType(type: string, category: string): boolean {
   return t === "delivered_file" || c === "file_delivered";
 }
 
+/** Nurturing Outcome-stage outcome letters (PDF / JPG / PNG) on a lead card. */
+function isOutcomeLetterType(type: string, category: string): boolean {
+  const t = type.trim().toLowerCase();
+  const c = category.trim().toLowerCase();
+  return t === "outcome_letter" || c === "outcome_letter";
+}
+
+function isSeLeadCardDocType(type: string, category: string): boolean {
+  return (
+    isScreenshotType(type, category) ||
+    isDeliveredFileType(type, category) ||
+    isOutcomeLetterType(type, category)
+  );
+}
+
+const CARD_DOC_MIMES = new Set(["application/pdf", "image/jpeg", "image/jpg", "image/png"]);
+
+/** PDF / JPG / PNG for File Delivered ("file received") and Outcome letter uploads. */
+function assertCardDocMime(type: string, category: string, mimeType: string, filename: string) {
+  const label = isOutcomeLetterType(type, category)
+    ? "Outcome letter"
+    : isDeliveredFileType(type, category)
+      ? "File received"
+      : null;
+  if (!label) return;
+  const mime = (mimeType.split(";")[0] ?? "").trim().toLowerCase();
+  const ext = filename.includes(".") ? (filename.split(".").pop() ?? "").toLowerCase() : "";
+  const okExt = ext === "pdf" || ext === "jpg" || ext === "jpeg" || ext === "png";
+  if (CARD_DOC_MIMES.has(mime) || (mime === "application/octet-stream" && okExt)) return;
+  throw AppError.validation(`${label} must be a PDF, JPG, or PNG file`);
+}
+
 function hasPerm(claims: Claims, ...codes: string[]): boolean {
   return expandImplies(claims.permissions).hasAny(...codes);
 }
@@ -100,7 +132,7 @@ async function requireParents(
 }
 
 /**
- * SE may upload screenshots or File Delivered docs onto leads they can edit;
+ * SE may upload screenshots, File Delivered docs, or Outcome letters onto leads they can edit;
  * TL/admin use documents:create.
  */
 async function assertCanUploadNew(
@@ -118,7 +150,7 @@ async function assertCanUploadNew(
     leadId !== "" &&
     !input.customerId &&
     !input.dealId &&
-    (isScreenshotType(input.type, input.category) || isDeliveredFileType(input.type, input.category));
+    isSeLeadCardDocType(input.type, input.category);
   if (seLeadUpload) {
     await requireRecord(db, claims, Records.Leads, leadId, P.LeadsEdit, P.LeadsView);
     return;
@@ -126,7 +158,7 @@ async function assertCanUploadNew(
   throw AppError.forbidden("insufficient permissions");
 }
 
-/** SE may replace screenshot / delivered-file uploads on leads they can edit. */
+/** SE may replace screenshot / delivered-file / outcome-letter uploads on leads they can edit. */
 async function assertCanUploadExisting(
   db: Database,
   claims: Claims,
@@ -141,7 +173,7 @@ async function assertCanUploadExisting(
   await requireRecord(db, claims, Records.Documents, docId, P.DocumentsView);
   const doc = await service.get(docId);
   if (!doc.leadId) throw AppError.forbidden("insufficient permissions");
-  if (!isScreenshotType(doc.type, doc.category) && !isDeliveredFileType(doc.type, doc.category)) {
+  if (!isSeLeadCardDocType(doc.type, doc.category)) {
     throw AppError.forbidden("insufficient permissions");
   }
   await requireRecord(db, claims, Records.Leads, doc.leadId, P.LeadsEdit, P.LeadsView);
@@ -223,6 +255,8 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     const docId = form.value("documentId").trim() || pathParam(req, "id");
     if (docId !== "") {
       await assertCanUploadExisting(db, claims, service, docId);
+      const existing = await service.get(docId);
+      assertCardDocMime(existing.type, existing.category, upload.mimeType, upload.filename);
       ok(res, await service.uploadToExisting(claims.userId, docId, upload, meta));
       return;
     }
@@ -242,6 +276,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
       viewerUserIds: parseIdList(form, "viewerUserIds"),
       originalFilename: file.filename,
     };
+    assertCardDocMime(input.type, input.category, upload.mimeType, upload.filename);
     await assertCanUploadNew(db, claims, input);
     created(res, await service.uploadNew(claims, input, upload, meta));
   };
@@ -264,13 +299,10 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     if (hasPerm(claims, P.DocumentsDelete)) {
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsDelete);
     } else if (claims.roleCode === Role.SalesExecutive) {
-      // SE may remove screenshots / delivered files on leads they can edit.
+      // SE may remove screenshots / delivered files / outcome letters on leads they can edit.
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsView);
       const doc = await service.get(id);
-      if (
-        !doc.leadId ||
-        (!isScreenshotType(doc.type, doc.category) && !isDeliveredFileType(doc.type, doc.category))
-      ) {
+      if (!doc.leadId || !isSeLeadCardDocType(doc.type, doc.category)) {
         throw AppError.forbidden("insufficient permissions");
       }
       await requireRecord(db, claims, Records.Leads, doc.leadId, P.LeadsEdit, P.LeadsView);
