@@ -15,8 +15,10 @@ describe("sla copy", () => {
       slaHours: 5 * 24,
       ownerName: "Sarah",
     });
-    expect(copy.title).toBe("Lead SLA exceeded");
-    expect(copy.body).toBe("Acme Australia has remained in Contacted for 6 days, exceeding its 5-day SLA by 1 day.");
+    expect(copy.title).toBe("Lead stuck too long in a stage");
+    expect(copy.body).toBe(
+      "Acme Australia has been in Contacted for 6 days. The limit for that stage is 5 days (1 day overdue). Please follow up.",
+    );
   });
 
   it("rounds duration to whole days and keeps a stable dedupe key", () => {

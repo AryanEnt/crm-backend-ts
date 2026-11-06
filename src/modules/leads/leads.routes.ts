@@ -27,6 +27,7 @@ import { Records, requireRecords } from "../datascope/record.js";
 import { P, Role } from "../permissions/permissions.js";
 import { referralInputSchema } from "../referrals/referrals.service.js";
 import type { BoardFilter } from "./lead-stage.service.js";
+import { parseBoardOrder, parseBoardSort } from "./lead-stage.service.js";
 import { assignTargetInScope, type LeadListFilter, type LeadWriteResult, type LeadsService } from "./leads.service.js";
 
 export { assignTargetInScope };
@@ -96,6 +97,10 @@ const updateSchema = z.strictObject({
   nextActivityAt: optionalString(),
   status: optionalString(),
   lostReason: optionalString(),
+  negotiationTag: optionalString(),
+  negotiationRemarks: optionalString(),
+  contactRating: optionalInt(),
+  contactRemarks: optionalString(),
   forceStage: z.boolean().optional(),
   reopen: z.boolean().optional(),
   forceUpdate: bool(),
@@ -219,6 +224,8 @@ function boardFilter(req: Request): BoardFilter {
     ...valueRange(q),
     scope,
     limit: atoi(q("limit")),
+    sort: parseBoardSort(q("sort")),
+    order: parseBoardOrder(q("order")),
   };
 }
 
@@ -306,6 +313,26 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
   router.get("/api/v1/leads/:id/stage-history", ...guard(...view), inScope(db, Records.Leads, view), async (req, res) => {
     ok(res, await service.stages.listHistory(pathParam(req, "id")));
   });
+
+  router.get(
+    "/api/v1/leads/:id/document-delay-remarks",
+    ...guard(...view),
+    inScope(db, Records.Leads, view),
+    async (req, res) => {
+      ok(res, await service.listDocumentDelayRemarks(pathParam(req, "id")));
+    },
+  );
+
+  router.post(
+    "/api/v1/leads/:id/document-delay-remarks",
+    ...guard(...edit),
+    inScope(db, Records.Leads, edit),
+    jsonBody,
+    async (req, res) => {
+      const { body } = decodeJson(req, z.strictObject({ body: str() }));
+      ok(res, await service.addDocumentDelayRemark(claimsOf(req), pathParam(req, "id"), body, requestMeta(req)));
+    },
+  );
 
   router.patch("/api/v1/leads/:id", ...guard(...edit), inScope(db, Records.Leads, edit), jsonBody, async (req, res) => {
     const input = decodeJson(req, updateSchema);

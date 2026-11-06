@@ -45,18 +45,65 @@ export function parseInt64(s: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+export type Rfc822Attachment = {
+  filename: string;
+  mimeType: string;
+  content: Buffer;
+};
+
+function encodeFilename(name: string): string {
+  return name.replace(/[\r\n"]/g, "_");
+}
+
+function base64Lines(buf: Buffer): string {
+  const b64 = buf.toString("base64");
+  const lines: string[] = [];
+  for (let i = 0; i < b64.length; i += 76) lines.push(b64.slice(i, i + 76));
+  return lines.join("\r\n");
+}
+
 export function buildRfc822(
   fromName: string,
   fromAddr: string,
-  m: { toAddresses: string[]; ccAddresses: string[]; bccAddresses: string[]; subject: string; bodyHtml: string; bodyText: string },
+  m: {
+    toAddresses: string[];
+    ccAddresses: string[];
+    bccAddresses: string[];
+    subject: string;
+    bodyHtml: string;
+    bodyText: string;
+  },
+  attachments: Rfc822Attachment[] = [],
 ): string {
   const from = fromName !== "" ? `${fromName} <${fromAddr}>` : fromAddr;
   let b = `From: ${from}\r\nTo: ${m.toAddresses.join(", ")}\r\n`;
   if (m.ccAddresses.length > 0) b += `Cc: ${m.ccAddresses.join(", ")}\r\n`;
   if (m.bccAddresses.length > 0) b += `Bcc: ${m.bccAddresses.join(", ")}\r\n`;
   b += `Subject: ${m.subject}\r\nMIME-Version: 1.0\r\n`;
-  if (m.bodyHtml !== "") return `${b}Content-Type: text/html; charset=UTF-8\r\n\r\n${m.bodyHtml}`;
-  return `${b}Content-Type: text/plain; charset=UTF-8\r\n\r\n${m.bodyText}`;
+
+  if (attachments.length === 0) {
+    if (m.bodyHtml !== "") return `${b}Content-Type: text/html; charset=UTF-8\r\n\r\n${m.bodyHtml}`;
+    return `${b}Content-Type: text/plain; charset=UTF-8\r\n\r\n${m.bodyText}`;
+  }
+
+  const boundary = `crm_mix_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  b += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
+  if (m.bodyHtml !== "") {
+    b += `--${boundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${m.bodyHtml}\r\n`;
+  } else {
+    b += `--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n${m.bodyText}\r\n`;
+  }
+  for (const a of attachments) {
+    const name = encodeFilename(a.filename || "attachment");
+    const mime = (a.mimeType || "application/octet-stream").replace(/[\r\n]/g, "");
+    b += `--${boundary}\r\n`;
+    b += `Content-Type: ${mime}; name="${name}"\r\n`;
+    b += `Content-Transfer-Encoding: base64\r\n`;
+    b += `Content-Disposition: attachment; filename="${name}"\r\n\r\n`;
+    b += `${base64Lines(a.content)}\r\n`;
+  }
+  b += `--${boundary}--\r\n`;
+  return b;
 }
 
 // ------------------------------------------------ net/mail approximations

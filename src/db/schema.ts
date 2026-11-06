@@ -473,12 +473,19 @@ export interface EmailThreads {
 export interface Leads {
   anzsco_id: string | null;
   archived_at: Timestamp | null;
+  contact_rated_at: Timestamp | null;
+  contact_rated_by: string | null;
+  contact_rating: number | null;
+  contact_remarks: Generated<string>;
   converted_at: Timestamp | null;
   converted_customer_id: string | null;
   country: Generated<string>;
   created_at: Generated<Timestamp>;
   created_by_user_id: string | null;
   currency: Generated<string>;
+  document_delay_remarks: Generated<string>;
+  document_delay_remarks_at: Timestamp | null;
+  document_delay_remarks_by: string | null;
   email: string | null;
   employer: Generated<string>;
   expected_close_at: string | null;
@@ -493,6 +500,8 @@ export interface Leads {
   lost_at: Timestamp | null;
   lost_reason: Generated<string>;
   nationality: Generated<string>;
+  negotiation_remarks: Generated<string>;
+  negotiation_tag: Generated<string>;
   next_activity_at: Timestamp | null;
   notes: Generated<string>;
   occupation: Generated<string>;
@@ -916,6 +925,14 @@ export interface InAppNotifications {
   type: string;
 }
 
+export interface LeadDocumentDelayRemarks {
+  author_user_id: string | null;
+  body: string;
+  created_at: Generated<Timestamp>;
+  id: Generated<string>;
+  lead_id: string;
+}
+
 export interface DB {
   activities: Activities;
   activity_types: ActivityTypes;
@@ -944,6 +961,7 @@ export interface DB {
   email_templates: EmailTemplates;
   email_threads: EmailThreads;
   in_app_notifications: InAppNotifications;
+  lead_document_delay_remarks: LeadDocumentDelayRemarks;
   lead_score_snapshots: LeadScoreSnapshots;
   lead_sources: LeadSources;
   lead_stage_transitions: LeadStageTransitions;

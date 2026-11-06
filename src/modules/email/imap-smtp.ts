@@ -205,6 +205,11 @@ export class ImapSmtpTransport implements MailTransport {
         text: mail.text,
         html: mail.html,
         inReplyTo: mail.inReplyTo,
+        attachments: (mail.attachments ?? []).map((a) => ({
+          filename: a.filename,
+          content: a.content,
+          contentType: a.mimeType || "application/octet-stream",
+        })),
         envelope: { from: mail.fromAddress, to: [...mail.to, ...mail.cc, ...mail.bcc] },
       });
       const providerMessageId = String(info.messageId || "").trim() || `smtp:${Date.now()}`;

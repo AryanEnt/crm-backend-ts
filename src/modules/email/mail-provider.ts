@@ -31,6 +31,12 @@ export type FetchedMail = {
   folder: MailFolderKind;
 };
 
+export type SendMailAttachment = {
+  filename: string;
+  mimeType: string;
+  content: Buffer;
+};
+
 export type SendMailInput = {
   fromName: string;
   fromAddress: string;
@@ -42,6 +48,7 @@ export type SendMailInput = {
   text: string;
   inReplyTo?: string;
   sentFolder?: string;
+  attachments?: SendMailAttachment[];
 };
 
 export type SendMailResult = {

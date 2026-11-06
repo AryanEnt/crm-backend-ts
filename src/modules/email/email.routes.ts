@@ -19,6 +19,12 @@ const PUBSUB_BODY_LIMIT = 1 << 20;
 const associateSchema = z.strictObject({ leadId: optionalString(), customerId: optionalString(), dealId: optionalString() });
 const patchThreadSchema = z.strictObject({ starred: optionalBool(), archived: optionalBool() });
 
+const composeAttachmentSchema = z.strictObject({
+  filename: str(),
+  mimeType: str(),
+  contentBase64: str(),
+});
+
 const composeSchema = z.strictObject({
   accountId: str(),
   to: stringArray(),
@@ -34,6 +40,10 @@ const composeSchema = z.strictObject({
   threadId: optionalString(),
   scheduledAt: optionalString(),
   send: bool(),
+  attachments: z
+    .array(composeAttachmentSchema)
+    .nullish()
+    .transform((v) => v ?? undefined),
 });
 
 const draftSchema = z.strictObject({

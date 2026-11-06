@@ -23,6 +23,9 @@ export function scopedFilter(req: Request, viewPermission: string): { f: Analyti
   return { f, scope: rs.scope };
 }
 
+
+
+
 export function analyticsRouter(service: AnalyticsService, guard: Guard): Router {
   const router = createRouter();
   const view = guard(P.AnalyticsView);

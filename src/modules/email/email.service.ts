@@ -91,6 +91,12 @@ export interface PreviewResult {
 /** Go *string fields: undefined when absent or null. */
 type Ref = string | undefined;
 
+export type ComposeAttachmentInput = {
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+};
+
 export interface ComposeInput {
   accountId: string;
   to: string[] | undefined;
@@ -106,6 +112,39 @@ export interface ComposeInput {
   threadId: Ref;
   scheduledAt: Ref;
   send: boolean;
+  /** Outbound files (PDF/images/etc.); included when the message is sent. */
+  attachments?: ComposeAttachmentInput[] | undefined;
+}
+
+const MAX_OUTBOUND_ATTACHMENTS = 10;
+const MAX_OUTBOUND_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+function parseComposeAttachments(
+  raw: ComposeAttachmentInput[] | undefined,
+): { filename: string; mimeType: string; content: Buffer }[] {
+  const list = raw ?? [];
+  if (list.length > MAX_OUTBOUND_ATTACHMENTS) {
+    throw AppError.validation(`You can attach up to ${MAX_OUTBOUND_ATTACHMENTS} files`);
+  }
+  const out: { filename: string; mimeType: string; content: Buffer }[] = [];
+  for (const a of list) {
+    const filename = (a.filename ?? "").trim() || "attachment";
+    const mimeType = (a.mimeType ?? "").trim() || "application/octet-stream";
+    const b64 = (a.contentBase64 ?? "").replace(/\s+/g, "");
+    if (b64 === "") throw AppError.validation(`Attachment “${filename}” is empty`);
+    let content: Buffer;
+    try {
+      content = Buffer.from(b64, "base64");
+    } catch {
+      throw AppError.validation(`Attachment “${filename}” is invalid`);
+    }
+    if (content.length === 0) throw AppError.validation(`Attachment “${filename}” is empty`);
+    if (content.length > MAX_OUTBOUND_ATTACHMENT_BYTES) {
+      throw AppError.validation(`“${filename}” is over 15 MB`);
+    }
+    out.push({ filename, mimeType, content });
+  }
+  return out;
 }
 
 export interface DraftPatch {
@@ -767,6 +806,7 @@ export class EmailService {
     if (in_.send && !preview.canSend) throw AppError.validation("Email still contains unresolved variables");
     const to = uniqueEmails(in_.to);
     if (in_.send && to.length === 0) throw AppError.validation("Add at least one recipient");
+    const attachments = parseComposeAttachments(in_.attachments);
     const thread = await this.threadForCompose(acc, in_, to);
     const scheduled = in_.scheduledAt !== undefined && in_.scheduledAt.trim() !== "";
     const status = scheduled ? "scheduled" : in_.send ? "sending" : "draft";
@@ -797,11 +837,32 @@ export class EmailService {
       receivedAt: null,
       scheduledAt,
       status,
-      hasAttachments: false,
+      hasAttachments: attachments.length > 0,
       inReplyTo: ref(in_.inReplyTo),
     });
+    if (saved && attachments.length > 0) {
+      for (const a of attachments) {
+        await this.repo.insertAttachment({
+          messageId: saved.id,
+          filename: a.filename,
+          mimeType: a.mimeType,
+          sizeBytes: a.content.length,
+          providerAttachmentId: "",
+        });
+      }
+      saved.attachments = attachments.map((a, i) => ({
+        id: `pending-${i}`,
+        messageId: saved.id,
+        filename: a.filename,
+        mimeType: a.mimeType,
+        sizeBytes: a.content.length,
+        providerAttachmentId: "",
+      }));
+    }
     await this.repo.refreshThreadStats(thread!.id).catch(() => undefined);
-    if (status === "sending") return this.sendMessage(claims.userId, acc, thread!, saved!, meta);
+    if (status === "sending") {
+      return this.sendMessage(claims.userId, acc, thread!, saved!, meta, attachments);
+    }
     return saved;
   }
 
@@ -865,12 +926,19 @@ export class EmailService {
     return this.sendMessage(claims.userId, acc, thread, m, meta);
   }
 
-  private async sendMessage(actorId: string, acc: AccountRecord, thread: Thread, m: Message, meta: RequestMeta): Promise<Message | null> {
+  private async sendMessage(
+    actorId: string,
+    acc: AccountRecord,
+    thread: Thread,
+    m: Message,
+    meta: RequestMeta,
+    outboundAttachments: { filename: string; mimeType: string; content: Buffer }[] = [],
+  ): Promise<Message | null> {
     if (m.toAddresses.length === 0) throw AppError.validation("Add at least one recipient");
     m.fromAddress = acc.emailAddress;
     m.fromName = acc.displayName;
     // migadu / spacemail / custom imap all use SMTP — not Gmail OAuth
-    if (isImapProvider(acc.provider)) return this.sendImap(actorId, acc, thread, m, meta);
+    if (isImapProvider(acc.provider)) return this.sendImap(actorId, acc, thread, m, meta, outboundAttachments);
     let token: string;
     try {
       token = await this.accessToken(acc);
@@ -880,7 +948,7 @@ export class EmailService {
       await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: "reauth" }, meta);
       throw err;
     }
-    const raw = buildRfc822(acc.displayName, acc.emailAddress, m);
+    const raw = buildRfc822(acc.displayName, acc.emailAddress, m, outboundAttachments);
     const threadId = thread.providerThreadId.startsWith("local-") ? "" : thread.providerThreadId;
     let sent;
     try {
@@ -1400,6 +1468,7 @@ export class EmailService {
     thread: Thread,
     m: Message,
     meta: RequestMeta,
+    outboundAttachments: { filename: string; mimeType: string; content: Buffer }[] = [],
   ): Promise<Message | null> {
     const settings = this.settingsForAccount(acc);
     let sent;
@@ -1419,6 +1488,7 @@ export class EmailService {
         text: m.bodyText || stripTags(m.bodyHtml),
         inReplyTo: m.inReplyTo ?? undefined,
         sentFolder: acc.imapSentFolder || undefined,
+        attachments: outboundAttachments,
       });
     } catch (err) {
       const safe = classifyMailError(err);

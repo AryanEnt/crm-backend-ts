@@ -70,6 +70,13 @@ function isScreenshotType(type: string, category: string): boolean {
   return type.trim().toLowerCase() === "screenshot" || category.trim().toLowerCase() === "screenshot";
 }
 
+/** Nurturing File Delivered uploads (PDF / JPG / PNG) on a lead card. */
+function isDeliveredFileType(type: string, category: string): boolean {
+  const t = type.trim().toLowerCase();
+  const c = category.trim().toLowerCase();
+  return t === "delivered_file" || c === "file_delivered";
+}
+
 function hasPerm(claims: Claims, ...codes: string[]): boolean {
   return expandImplies(claims.permissions).hasAny(...codes);
 }
@@ -92,7 +99,10 @@ async function requireParents(
   }
 }
 
-/** SE may upload screenshots onto leads they can edit; TL/admin use documents:create. */
+/**
+ * SE may upload screenshots or File Delivered docs onto leads they can edit;
+ * TL/admin use documents:create.
+ */
 async function assertCanUploadNew(
   db: Database,
   claims: Claims,
@@ -103,17 +113,38 @@ async function assertCanUploadNew(
     return;
   }
   const leadId = input.leadId?.trim() ?? "";
-  if (
+  const seLeadUpload =
     claims.roleCode === Role.SalesExecutive &&
-    isScreenshotType(input.type, input.category) &&
     leadId !== "" &&
     !input.customerId &&
-    !input.dealId
-  ) {
+    !input.dealId &&
+    (isScreenshotType(input.type, input.category) || isDeliveredFileType(input.type, input.category));
+  if (seLeadUpload) {
     await requireRecord(db, claims, Records.Leads, leadId, P.LeadsEdit, P.LeadsView);
     return;
   }
   throw AppError.forbidden("insufficient permissions");
+}
+
+/** SE may replace screenshot / delivered-file uploads on leads they can edit. */
+async function assertCanUploadExisting(
+  db: Database,
+  claims: Claims,
+  service: DocumentsService,
+  docId: string,
+) {
+  if (hasPerm(claims, P.DocumentsCreate)) {
+    await requireRecord(db, claims, Records.Documents, docId, P.DocumentsCreate);
+    return;
+  }
+  if (claims.roleCode !== Role.SalesExecutive) throw AppError.forbidden("insufficient permissions");
+  await requireRecord(db, claims, Records.Documents, docId, P.DocumentsView);
+  const doc = await service.get(docId);
+  if (!doc.leadId) throw AppError.forbidden("insufficient permissions");
+  if (!isScreenshotType(doc.type, doc.category) && !isDeliveredFileType(doc.type, doc.category)) {
+    throw AppError.forbidden("insufficient permissions");
+  }
+  await requireRecord(db, claims, Records.Leads, doc.leadId, P.LeadsEdit, P.LeadsView);
 }
 
 const orUndefined = (v: string): string | undefined => (v === "" ? undefined : v);
@@ -191,8 +222,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
 
     const docId = form.value("documentId").trim() || pathParam(req, "id");
     if (docId !== "") {
-      if (!hasPerm(claims, P.DocumentsCreate)) throw AppError.forbidden("insufficient permissions");
-      await requireRecord(db, claims, Records.Documents, docId, P.DocumentsCreate);
+      await assertCanUploadExisting(db, claims, service, docId);
       ok(res, await service.uploadToExisting(claims.userId, docId, upload, meta));
       return;
     }
@@ -234,10 +264,13 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     if (hasPerm(claims, P.DocumentsDelete)) {
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsDelete);
     } else if (claims.roleCode === Role.SalesExecutive) {
-      // SE may remove screenshots on leads they can see.
+      // SE may remove screenshots / delivered files on leads they can edit.
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsView);
       const doc = await service.get(id);
-      if (!isScreenshotType(doc.type, doc.category) || !doc.leadId) {
+      if (
+        !doc.leadId ||
+        (!isScreenshotType(doc.type, doc.category) && !isDeliveredFileType(doc.type, doc.category))
+      ) {
         throw AppError.forbidden("insufficient permissions");
       }
       await requireRecord(db, claims, Records.Leads, doc.leadId, P.LeadsEdit, P.LeadsView);
@@ -271,7 +304,8 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     });
   });
 
-  router.post("/api/v1/documents/:id/upload", ...guard(...create), inScope(db, Records.Documents, create), upload);
+  // Auth only — create vs SE lead uploads is decided in handleUpload.
+  router.post("/api/v1/documents/:id/upload", ...guard(), upload);
 
   router.post("/api/v1/documents/:id/verify", ...guard(...edit), inScope(db, Records.Documents, edit), async (req, res) => {
     ok(res, await service.verify(claimsOf(req).userId, pathParam(req, "id"), requestMetaFirstHop(req)));

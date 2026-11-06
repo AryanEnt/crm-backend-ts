@@ -855,7 +855,7 @@ export class AnalyticsRepository {
 
   /**
    * Lead population by residence country (`leads.country`).
-   * Stage buckets follow the active Lead Pipeline names (Lead ≈ New).
+   * Stage buckets follow the active Leads Pipeline names (Leads ≈ New; Purchased ≈ Won).
    * Conversion rate = won / (won + lost), matching Sales Funnel win rate.
    */
   async countryPopulation(f: AnalyticsFilter, opts: { includePrevious?: boolean } = {}): Promise<CountryPopulationAnalytics> {
@@ -874,15 +874,17 @@ export class AnalyticsRepository {
         COALESCE(NULLIF(TRIM(l.country), ''), '(Unknown)') AS country,
         COUNT(*)::int AS total,
         COUNT(*) FILTER (
-          WHERE LOWER(COALESCE(ps.name, '')) IN ('lead', 'new', 'created', 'cold lead')
+          WHERE LOWER(COALESCE(ps.name, '')) IN ('leads', 'lead', 'new', 'created', 'cold lead')
         )::int AS "newCount",
         COUNT(*) FILTER (WHERE LOWER(COALESCE(ps.name, '')) = 'contacted')::int AS contacted,
-        COUNT(*) FILTER (WHERE LOWER(COALESCE(ps.name, '')) = 'qualified')::int AS qualified,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(ps.name, '')) IN ('qualified', 'negotiation')
+        )::int AS qualified,
         COUNT(*) FILTER (
           WHERE ps.is_lost = TRUE OR LOWER(COALESCE(ps.name, '')) IN ('lost', 'unqualified')
         )::int AS unqualified,
         COUNT(*) FILTER (
-          WHERE ps.is_won = TRUE OR LOWER(COALESCE(ps.name, '')) = 'won'
+          WHERE ps.is_won = TRUE OR LOWER(COALESCE(ps.name, '')) IN ('won', 'purchased', 'outcome')
         )::int AS won,
         COUNT(*) FILTER (
           WHERE ps.is_lost = TRUE OR LOWER(COALESCE(ps.name, '')) IN ('lost', 'unqualified')
