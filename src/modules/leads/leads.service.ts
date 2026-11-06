@@ -1056,6 +1056,8 @@ export class LeadsService {
               isArchived: cur.isArchived,
               stageEnteredAt: cur.stageEnteredAt,
               createdAt: cur.createdAt,
+              contactRating: in_.contactRating !== undefined ? in_.contactRating : cur.contactRating,
+              contactRemarks: in_.contactRemarks !== undefined ? in_.contactRemarks.trim() : cur.contactRemarks,
             },
           )
         : null;
