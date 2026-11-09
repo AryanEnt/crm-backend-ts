@@ -117,6 +117,8 @@ const moveSchema = z.strictObject({
   lostReason: str(),
   documentDeadline: optionalString(),
   closingAmount: optionalInt(),
+  /** Optional sale notes captured when marking Purchased. */
+  purchaseNotes: optionalString(),
   nextActivity: optionalObject(nextActivitySchema),
 });
 

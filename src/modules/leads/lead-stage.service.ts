@@ -56,6 +56,8 @@ export interface MoveLeadInput {
   documentDeadline?: string | undefined;
   /** Whole amount saved as the lead value when marking Sales Won. */
   closingAmount?: number | undefined;
+  /** Optional sale description appended to lead notes when marking Sales Won. */
+  purchaseNotes?: string | undefined;
   nextActivity?: NextActivityInput | undefined;
 }
 
@@ -367,6 +369,8 @@ interface MovePlan {
   /** Keep won_at when handing a Won lead into Nurturing (status becomes open again). */
   preserveWonAt?: boolean;
   closingAmount?: number | null;
+  /** Sale notes to append when marking Sales Won. */
+  purchaseNotes?: string | null;
 }
 
 export function parseClosingAmount(raw: number | undefined): number | null {
@@ -655,6 +659,7 @@ export class LeadStageService {
       forced: force,
       reopened: closed,
       closingAmount: salesWon ? parseClosingAmount(in_.closingAmount) : null,
+      purchaseNotes: salesWon ? (in_.purchaseNotes ?? "").trim() || null : null,
     };
   }
 
@@ -692,6 +697,14 @@ export class LeadStageService {
             potential_value = CASE
               WHEN ${plan.closingAmount != null}::bool THEN ${plan.closingAmount}
               ELSE potential_value
+            END,
+            notes = CASE
+              WHEN ${plan.purchaseNotes != null && plan.purchaseNotes !== ""}::bool THEN
+                CASE
+                  WHEN notes IS NULL OR btrim(notes) = '' THEN ${plan.purchaseNotes}
+                  ELSE notes || E'\n\n' || ${plan.purchaseNotes}
+                END
+              ELSE notes
             END,
             last_activity_at = ${now}
           WHERE id = ${lead.id}`.execute(tx);
