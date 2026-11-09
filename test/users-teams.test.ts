@@ -212,4 +212,47 @@ describe("users and teams routes", () => {
       .send({ name: "New team" });
     expect([res.status, res.body.error.message]).toEqual([403, "Only Super Admin can change team setup"]);
   });
+
+  it("refuses permanent user delete to team-scoped callers", async () => {
+    const f = fakeDb();
+    f.queue(
+      [userRow({ id: "tl-a", roleCode: Role.SalesManager })],
+      [{ code: P.UsersDelete, scope: "team" }],
+      [{ teamId: teamA }],
+      [],
+    );
+    const res = await request(createApp({ config: config(), db: f.db }))
+      .delete("/api/v1/users/se-a1")
+      .set("Authorization", bearer());
+    expect([res.status, res.body.error.message]).toEqual([403, "Only Super Admin can permanently delete users"]);
+  });
+
+  it("refuses permanent team delete to team-scoped callers", async () => {
+    const f = fakeDb();
+    f.queue(
+      [userRow({ id: "tl-a", roleCode: Role.SalesManager })],
+      [{ code: P.TeamsDelete, scope: "team" }],
+      [{ teamId: teamA }],
+      [],
+    );
+    const res = await request(createApp({ config: config(), db: f.db }))
+      .delete(`/api/v1/teams/${teamA}`)
+      .set("Authorization", bearer());
+    expect([res.status, res.body.error.message]).toEqual([403, "Only Super Admin can change team setup"]);
+  });
+
+  it("refuses dissolve to team-scoped callers", async () => {
+    const f = fakeDb();
+    f.queue(
+      [userRow({ id: "tl-a", roleCode: Role.SalesManager })],
+      [{ code: P.TeamsDelete, scope: "team" }],
+      [{ teamId: teamA }],
+      [],
+    );
+    const res = await request(createApp({ config: config(), db: f.db }))
+      .post(`/api/v1/teams/${teamA}/dissolve`)
+      .set("Authorization", bearer())
+      .send({ newTeamName: "Replacement" });
+    expect([res.status, res.body.error.message]).toEqual([403, "Only Super Admin can change team setup"]);
+  });
 });

@@ -55,6 +55,31 @@ export type UpdateInput = z.output<typeof updateSchema>;
 
 export const statusSchema = z.strictObject({ isActive: bool() });
 
+/** Dissolve a team: move people (and optionally records) to another team, then delete. */
+export const dissolveSchema = z.strictObject({
+  /** Existing destination team. Mutually exclusive with newTeamName. */
+  destinationTeamId: optionalString(),
+  /** Create this team as the destination, then move everyone onto it. */
+  newTeamName: optionalString(),
+  newTeamDescription: optionalString(),
+  /** Re-stamp leads/customers/deals onto the destination (default true). */
+  moveLeads: optionalBool(),
+  /**
+   * When the destination already has a Team Lead and this team also has one:
+   * unassign = leave former lead with no team; deactivate = also deactivate their login.
+   */
+  formerLeadAction: z.enum(["unassign", "deactivate"]).optional(),
+});
+export type DissolveInput = z.output<typeof dissolveSchema>;
+
+export type DissolveResult = {
+  deleted: true;
+  destinationTeamId: string | null;
+  movedMembers: number;
+  movedLeads: number;
+  formerLeadDeactivated: boolean;
+};
+
 export interface TeamListFilter {
   search: string;
   isActive: boolean | undefined;
@@ -220,6 +245,148 @@ export class TeamsRepository {
     return this.get(id);
   }
 
+  async delete(id: string): Promise<boolean> {
+    const r = await sql`DELETE FROM teams WHERE id = ${id}`.execute(this.db);
+    return Number(r.numAffectedRows ?? 0n) > 0;
+  }
+
+  async countOpenLeads(teamId: string): Promise<number> {
+    const r = await sql<{ total: number }>`
+      SELECT COUNT(*)::int AS total FROM leads
+      WHERE team_id = ${teamId} AND COALESCE(is_archived, FALSE) = FALSE`.execute(this.db);
+    return r.rows[0]?.total ?? 0;
+  }
+
+  /**
+   * Move membership + optional CRM records to destination, then delete the source team.
+   * Runs in one transaction so a failed membership rule never leaves a half-moved team.
+   */
+  async dissolve(
+    sourceId: string,
+    opts: {
+      destinationTeamId?: string;
+      newTeam?: { name: string; description: string };
+      moveLeads: boolean;
+      formerLeadAction: "unassign" | "deactivate";
+    },
+  ): Promise<{
+    destinationTeamId: string;
+    movedMembers: number;
+    movedLeads: number;
+    formerLeadDeactivated: boolean;
+    createdDestination: boolean;
+  }> {
+    return this.db.transaction().execute(async (tx) => {
+      const source = await sql<{
+        id: string;
+        teamLeadUserId: string | null;
+      }>`
+        SELECT id::text AS "id", team_lead_user_id::text AS "teamLeadUserId"
+        FROM teams WHERE id = ${sourceId} FOR UPDATE`.execute(tx);
+      if (!source.rows[0]) throw AppError.notFound("team not found");
+
+      let destinationId = (opts.destinationTeamId ?? "").trim();
+      let createdDestination = false;
+      if (opts.newTeam) {
+        destinationId = randomUUID();
+        try {
+          await sql`
+            INSERT INTO teams (id, name, description, team_lead_user_id)
+            VALUES (
+              ${destinationId},
+              ${opts.newTeam.name},
+              ${opts.newTeam.description},
+              NULL
+            )`.execute(tx);
+        } catch (err) {
+          if (isNameConflict(err)) throw AppError.conflict("team name already exists");
+          throw err;
+        }
+        createdDestination = true;
+      }
+
+      if (!destinationId || destinationId === sourceId) {
+        throw AppError.validation("Destination must be a different team");
+      }
+
+      const dest = await sql<{
+        id: string;
+        teamLeadUserId: string | null;
+        isActive: boolean;
+      }>`
+        SELECT id::text AS "id", team_lead_user_id::text AS "teamLeadUserId", is_active AS "isActive"
+        FROM teams WHERE id = ${destinationId} FOR UPDATE`.execute(tx);
+      if (!dest.rows[0]) throw AppError.notFound("destination team not found");
+      if (!dest.rows[0].isActive) throw AppError.validation("Destination team is inactive");
+
+      const members = await sql<{ id: string; roleCode: string }>`
+        SELECT u.id::text AS "id", r.code AS "roleCode"
+        FROM team_members tm
+        JOIN users u ON u.id = tm.user_id
+        JOIN roles r ON r.id = u.role_id
+        WHERE tm.team_id = ${sourceId}`.execute(tx);
+
+      const sourceLeadId = source.rows[0].teamLeadUserId;
+      const destLeadId = dest.rows[0].teamLeadUserId;
+      const destHasOtherLead =
+        destLeadId !== null && destLeadId !== "" && destLeadId !== sourceLeadId;
+      let formerLeadDeactivated = false;
+      let movedMembers = 0;
+
+      await sql`UPDATE teams SET team_lead_user_id = NULL WHERE id = ${sourceId}`.execute(tx);
+      await sql`DELETE FROM team_members WHERE team_id = ${sourceId}`.execute(tx);
+
+      for (const m of members.rows) {
+        if (m.roleCode !== Role.SalesExecutive) continue;
+        await sql`
+          INSERT INTO team_members (team_id, user_id) VALUES (${destinationId}, ${m.id})
+          ON CONFLICT DO NOTHING`.execute(tx);
+        movedMembers += 1;
+      }
+
+      if (sourceLeadId) {
+        if (!destHasOtherLead) {
+          await sql`
+            INSERT INTO team_members (team_id, user_id) VALUES (${destinationId}, ${sourceLeadId})
+            ON CONFLICT DO NOTHING`.execute(tx);
+          await sql`
+            UPDATE teams SET team_lead_user_id = ${sourceLeadId} WHERE id = ${destinationId}`.execute(tx);
+          movedMembers += 1;
+        } else if (opts.formerLeadAction === "deactivate") {
+          await sql`
+            UPDATE users SET is_active = FALSE, deactivated_at = NOW()
+            WHERE id = ${sourceLeadId}`.execute(tx);
+          formerLeadDeactivated = true;
+        }
+      }
+
+      let movedLeads = 0;
+      if (opts.moveLeads) {
+        const leads = await sql`
+          UPDATE leads SET team_id = ${destinationId}
+          WHERE team_id = ${sourceId}`.execute(tx);
+        movedLeads = Number(leads.numAffectedRows ?? 0n);
+        await sql`
+          UPDATE customers SET team_id = ${destinationId}
+          WHERE team_id = ${sourceId}`.execute(tx);
+        await sql`
+          UPDATE deals SET team_id = ${destinationId}
+          WHERE team_id = ${sourceId}`.execute(tx);
+      }
+
+      const deleted = await sql`DELETE FROM teams WHERE id = ${sourceId}`.execute(tx);
+      if (Number(deleted.numAffectedRows ?? 0n) === 0) throw AppError.notFound("team not found");
+
+      return {
+        destinationTeamId: destinationId,
+        movedMembers,
+        movedLeads,
+        formerLeadDeactivated,
+        createdDestination,
+      };
+    });
+  }
+
   /** Role codes by user id, for the users that exist. */
   async userRoles(ids: string[]): Promise<Map<string, string>> {
     const out = new Map<string, string>();
@@ -350,6 +517,115 @@ export class TeamsService {
     if (!team) throw AppError.notFound("team not found");
     await this.audit.record(claims.userId, active ? "team.activated" : "team.deactivated", "team", id, null, meta);
     return team;
+  }
+
+  /** Permanent removal with no people/records to move. Prefer dissolve when the team has members. */
+  async delete(claims: Claims, id: string, meta: RequestMeta): Promise<void> {
+    const access = TeamAccess.for(claims, P.TeamsDelete);
+    if (!access.canSee(id)) throw AppError.notFound("team not found");
+    access.requireOrganization();
+    const team = await internal("failed to load team", () => this.repo.get(id));
+    if (!team) throw AppError.notFound("team not found");
+    if (team.memberCount > 0) {
+      throw AppError.validation(
+        "This team still has members. Use dissolve to move them to another team first.",
+      );
+    }
+    const okDelete = await internal("failed to delete team", () => this.repo.delete(id));
+    if (!okDelete) throw AppError.notFound("team not found");
+    await this.audit.record(
+      claims.userId,
+      "team.deleted",
+      "team",
+      id,
+      { name: team.name, memberCount: team.memberCount },
+      meta,
+    );
+  }
+
+  /**
+   * Move people (and optionally leads) onto another team — existing or created inline —
+   * then permanently delete this team.
+   */
+  async dissolve(claims: Claims, id: string, in_: DissolveInput, meta: RequestMeta): Promise<DissolveResult> {
+    const access = TeamAccess.for(claims, P.TeamsDelete);
+    if (!access.canSee(id)) throw AppError.notFound("team not found");
+    access.requireOrganization();
+
+    const team = await internal("failed to load team", () => this.repo.get(id));
+    if (!team) throw AppError.notFound("team not found");
+
+    const destIdRaw = (in_.destinationTeamId ?? "").trim();
+    const newName = (in_.newTeamName ?? "").trim();
+    const moveLeads = in_.moveLeads !== false;
+    const formerLeadAction = in_.formerLeadAction ?? "unassign";
+    const leadCount = await internal("failed to count leads", () => this.repo.countOpenLeads(id));
+    const needsDestination = team.memberCount > 0 || (moveLeads && leadCount > 0);
+
+    if (!needsDestination) {
+      await this.delete(claims, id, meta);
+      return {
+        deleted: true,
+        destinationTeamId: null,
+        movedMembers: 0,
+        movedLeads: 0,
+        formerLeadDeactivated: false,
+      };
+    }
+
+    if (destIdRaw === "" && newName === "") {
+      throw AppError.validation("Choose an existing team or create a new one for these people");
+    }
+    if (destIdRaw !== "" && newName !== "") {
+      throw AppError.validation("Pick either an existing team or a new team name, not both");
+    }
+    if (destIdRaw === id) throw AppError.validation("Destination must be a different team");
+
+    const result = await internal("failed to dissolve team", () =>
+      this.repo.dissolve(id, {
+        destinationTeamId: destIdRaw || undefined,
+        newTeam:
+          newName !== ""
+            ? { name: newName, description: (in_.newTeamDescription ?? "").trim() }
+            : undefined,
+        moveLeads,
+        formerLeadAction,
+      }),
+    );
+
+    if (result.createdDestination) {
+      await this.audit.record(
+        claims.userId,
+        "team.created",
+        "team",
+        result.destinationTeamId,
+        { name: newName, via: "dissolve" },
+        meta,
+      );
+    }
+
+    await this.audit.record(
+      claims.userId,
+      "team.dissolved",
+      "team",
+      id,
+      {
+        name: team.name,
+        destinationTeamId: result.destinationTeamId,
+        movedMembers: result.movedMembers,
+        movedLeads: result.movedLeads,
+        formerLeadDeactivated: result.formerLeadDeactivated,
+      },
+      meta,
+    );
+
+    return {
+      deleted: true,
+      destinationTeamId: result.destinationTeamId,
+      movedMembers: result.movedMembers,
+      movedLeads: result.movedLeads,
+      formerLeadDeactivated: result.formerLeadDeactivated,
+    };
   }
 
   /** Trims and de-duplicates members, adds the lead, and checks every role. */

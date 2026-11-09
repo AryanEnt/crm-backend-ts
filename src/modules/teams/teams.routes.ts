@@ -8,7 +8,13 @@ import { jsonBody } from "../../middleware/errors.js";
 import { claimsOf } from "../auth/auth.middleware.js";
 import type { Guard } from "../auth/guard.js";
 import { P } from "../permissions/permissions.js";
-import { createSchema, statusSchema, updateSchema, type TeamsService } from "./teams.service.js";
+import {
+  createSchema,
+  dissolveSchema,
+  statusSchema,
+  updateSchema,
+  type TeamsService,
+} from "./teams.service.js";
 
 export function teamsRouter(service: TeamsService, guard: Guard): Router {
   const router = createRouter();
@@ -43,6 +49,16 @@ export function teamsRouter(service: TeamsService, guard: Guard): Router {
   router.post("/api/v1/teams/:id/status", ...guard(P.TeamsDelete, P.TeamsManage), jsonBody, async (req, res) => {
     const input = decodeJson(req, statusSchema);
     ok(res, await service.setActive(claimsOf(req), pathParam(req, "id"), input.isActive, requestMeta(req)));
+  });
+
+  router.post("/api/v1/teams/:id/dissolve", ...guard(P.TeamsDelete, P.TeamsManage), jsonBody, async (req, res) => {
+    const input = decodeJson(req, dissolveSchema);
+    ok(res, await service.dissolve(claimsOf(req), pathParam(req, "id"), input, requestMeta(req)));
+  });
+
+  router.delete("/api/v1/teams/:id", ...guard(P.TeamsDelete, P.TeamsManage), async (req, res) => {
+    await service.delete(claimsOf(req), pathParam(req, "id"), requestMeta(req));
+    ok(res, { deleted: true });
   });
 
   return router;
