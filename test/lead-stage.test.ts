@@ -92,6 +92,7 @@ const movable = (extra: Partial<MovableLead> = {}): MovableLead => ({
   createdAt: new Date(Date.now() - 7_200_000),
   contactRating: null,
   contactRemarks: "",
+  nextFollowUpRemarks: "",
   ...extra,
 });
 
@@ -242,7 +243,14 @@ describe("LeadStageService.move", () => {
   it("reopening clears the outcome and records the reopen", async () => {
     const { f, svc } = service();
     f.queue(
-      [lead({ status: "lost", stageId: LOST.id, stageName: "Lost" })],
+      [
+        lead({
+          status: "lost",
+          stageId: LOST.id,
+          stageName: "Lost",
+          nextFollowUpRemarks: "Retry after budget cycle",
+        }),
+      ],
       [],
       [],
       [],
@@ -259,7 +267,7 @@ describe("LeadStageService.move", () => {
 
   it("Lost requires a reason", async () => {
     const { f, svc } = service();
-    f.queue([lead()]);
+    f.queue([lead({ nextFollowUpRemarks: "Closed out after no reply" })]);
     expect((await rejection(svc.move(user, "lead-1", { stageId: LOST.id }, META))).message).toBe("lost reason is required");
   });
 
@@ -294,6 +302,18 @@ describe("LeadStageService.move", () => {
     const repeats = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
     expect(repeats.message).toMatch(/different words/i);
 
+    f.queue([
+      lead({
+        stageId: CONTACTED.id,
+        stageName: "Contacted",
+        contactRating: 4,
+        contactRemarks: "spoke about budget timeline and next steps",
+      }),
+    ]);
+    const followUp = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(followUp.message).toMatch(/follow-up remarks/i);
+    expect(followUp.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
     f.queue(
       [
         lead({
@@ -301,6 +321,7 @@ describe("LeadStageService.move", () => {
           stageName: "Contacted",
           contactRating: 4,
           contactRemarks: "spoke about budget timeline and next steps",
+          nextFollowUpRemarks: "Call Thursday with fee options",
         }),
       ],
       [],
@@ -313,6 +334,43 @@ describe("LeadStageService.move", () => {
     );
     const out = await svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META);
     expect(out.changed).toBe(true);
+  });
+
+  it("blocks entering Contacted without next follow-up remarks; force cannot skip", async () => {
+    const CONTACTED = stage("s-contacted", "Contacted", { position: 2 });
+    const pipe: Pipeline = {
+      ...PIPELINE,
+      stages: [CREATED, CONTACTED, WON, LOST],
+    };
+    const pipelines = {
+      get: async (id: string) => (id === pipe.id ? pipe : null),
+      getStage: async (id: string) =>
+        [CREATED, CONTACTED, WON, LOST, INACTIVE, FOREIGN].find((s) => s.id === id) ?? null,
+    } as unknown as PipelinesRepository;
+    const f = fakeDb();
+    const svc = new LeadStageService(f.db as unknown as Database, pipelines, null, vi.fn());
+
+    f.queue([lead({ stageId: CREATED.id, stageName: "Leads" })]);
+    const missing = await rejection(svc.move(user, "lead-1", { stageId: CONTACTED.id }, META));
+    expect(missing.message).toMatch(/follow-up remarks/i);
+    expect(missing.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
+    f.queue([lead({ stageId: CREATED.id, stageName: "Leads" })]);
+    const forced = await rejection(svc.move(user, "lead-1", { stageId: CONTACTED.id, force: true }, META));
+    expect(forced.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
+    f.queue(
+      [lead({ stageId: CREATED.id, stageName: "Leads", nextFollowUpRemarks: "Send brochure Monday" })],
+      [],
+      [],
+      [],
+      [{ id: "t1", metadata: {} }],
+      [],
+      [],
+      [{ status: "open", nextActivityAt: null }],
+    );
+    const ok = await svc.move(user, "lead-1", { stageId: CONTACTED.id }, META);
+    expect(ok.changed).toBe(true);
   });
 
   it("rejects inactive stages and stages from another pipeline", async () => {

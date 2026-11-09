@@ -36,6 +36,11 @@ import { ImapSmtpTransport, type ImapSmtpSettings } from "./imap-smtp.js";
 import { assertMailHostAllowed, parseHostAllowlist } from "./mail-host-guard.js";
 import { assignedUserIds, canChangeMailboxSettings, canInviteUser, canManageMailbox, canSendFromMailbox } from "./mailbox-access.js";
 import {
+  assertCanAccessTemplateTeam,
+  canSeeAllTemplates,
+  resolveTemplateTeamId,
+} from "./template-access.js";
+import {
   classifyMailError,
   safeMailError,
   type FetchedMail,
@@ -996,12 +1001,16 @@ export class EmailService {
     return { ...out, unresolved, canSend: unresolved === null };
   }
 
-  listTemplates(claims: Claims): Promise<Template[]> {
-    return this.repo.listTemplates(claims.teamIds);
+  listTemplates(claims: Claims, includeInactive = false): Promise<Template[]> {
+    const showInactive = includeInactive && expandImplies(claims.permissions).has(P.EmailManage);
+    const activeOnly = !showInactive;
+    if (canSeeAllTemplates(claims)) return this.repo.listTemplates(null, activeOnly);
+    return this.repo.listTemplates(claims.teamIds, activeOnly);
   }
 
   async createTemplate(claims: Claims, in_: TemplateInput): Promise<Template | null> {
     if (in_.name.trim() === "") throw AppError.validation("Template name is required");
+    const teamId = resolveTemplateTeamId(claims, in_.teamId);
     return this.repo.insertTemplate({
       name: in_.name.trim(),
       subject: in_.subject,
@@ -1010,24 +1019,30 @@ export class EmailService {
       variables: in_.variables ?? [],
       isActive: in_.isActive ?? true,
       createdBy: claims.userId,
-      teamId: ref(in_.teamId),
+      teamId,
     });
   }
 
-  async updateTemplate(id: string, in_: TemplateInput): Promise<Template | null> {
+  async updateTemplate(claims: Claims, id: string, in_: TemplateInput): Promise<Template | null> {
     const t = await this.repo.getTemplate(id);
     if (!t) throw AppError.notFound("template not found");
+    assertCanAccessTemplateTeam(claims, t.teamId);
     if (in_.name.trim() !== "") t.name = in_.name.trim();
     if (in_.subject !== "") t.subject = in_.subject;
     if (in_.bodyHtml !== "") t.bodyHtml = in_.bodyHtml;
     if (in_.category !== "") t.category = in_.category;
     if (in_.variables !== undefined) t.variables = in_.variables;
     if (in_.isActive !== undefined) t.isActive = in_.isActive;
-    if (in_.teamId !== undefined) t.teamId = in_.teamId;
+    if (canSeeAllTemplates(claims) && in_.teamId !== undefined && in_.teamId !== "") {
+      t.teamId = in_.teamId;
+    }
     return this.repo.updateTemplate(t);
   }
 
-  deleteTemplate(id: string): Promise<void> {
+  async deleteTemplate(claims: Claims, id: string): Promise<void> {
+    const t = await this.repo.getTemplate(id);
+    if (!t) throw AppError.notFound("template not found");
+    assertCanAccessTemplateTeam(claims, t.teamId);
     return this.repo.deleteTemplate(id);
   }
 

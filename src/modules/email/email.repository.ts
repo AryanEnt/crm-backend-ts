@@ -868,12 +868,19 @@ export class EmailRepository {
     return r.rows;
   }
 
-  async listTemplates(teamIds: string[]): Promise<Template[]> {
-    const r = await sql<Template>`
-      ${templateSelect}
-      WHERE is_active=TRUE
-        AND (team_id IS NULL OR team_id = ANY(${teamIds}::uuid[]) OR cardinality(${teamIds}::uuid[])=0)
-      ORDER BY name`.execute(this.db);
+  async listTemplates(teamIds: string[] | null, activeOnly = true): Promise<Template[]> {
+    if (teamIds !== null && teamIds.length === 0) return [];
+    const activeClause = activeOnly ? sql`AND is_active=TRUE` : sql``;
+    const r =
+      teamIds === null
+        ? await sql<Template>`
+            ${templateSelect}
+            WHERE TRUE ${activeClause}
+            ORDER BY is_active DESC, name`.execute(this.db)
+        : await sql<Template>`
+            ${templateSelect}
+            WHERE team_id = ANY(${teamIds}::uuid[]) ${activeClause}
+            ORDER BY is_active DESC, name`.execute(this.db);
     return r.rows.map(toTemplate);
   }
 

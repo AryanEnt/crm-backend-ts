@@ -24,6 +24,7 @@ import {
   isContactedStage,
   parseContactRating,
 } from "./contact-rating.js";
+import { nextFollowUpRemarksProblem, requiresNextFollowUpRemarks } from "./next-follow-up-remarks.js";
 import {
   enqueuePhoneValidation,
   PhoneValidationService,
@@ -86,6 +87,8 @@ export interface Lead {
   contactRatedAt: Date | null;
   contactRatedBy: string | null;
   contactRatedByName: string | null;
+  /** Next follow-up plan; required on Contacted → Lost. */
+  nextFollowUpRemarks: string;
   /** Latest overdue document-delay remark (Nurturing). */
   documentDelayRemarks: string;
   documentDelayRemarksAt: Date | null;
@@ -184,6 +187,7 @@ export interface UpdateLeadInput {
   negotiationRemarks?: string | undefined;
   contactRating?: number | undefined;
   contactRemarks?: string | undefined;
+  nextFollowUpRemarks?: string | undefined;
   /** Set by LeadsService when saving a Contacted rating. */
   contactRatedBy?: string | null | undefined;
   /** Skips stage requirements when the PATCH moves the lead. */
@@ -283,6 +287,7 @@ const leadSelect = sql`
     COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
     l.contact_rating AS "contactRating",
     COALESCE(l.contact_remarks, '') AS "contactRemarks",
+    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
     l.contact_rated_at AS "contactRatedAt",
     l.contact_rated_by::text AS "contactRatedBy",
     cr.full_name AS "contactRatedByName",
@@ -344,6 +349,7 @@ const LEAD_KEYS: (keyof Lead)[] = [
   "skills", "potentialValue", "currency", "probability", "expectedCloseAt", "expectedOutcome", "lastActivityAt",
   "nextActivityAt", "status", "wonAt", "lostAt", "lostReason", "negotiationTag", "negotiationRemarks",
   "contactRating", "contactRemarks", "contactRatedAt", "contactRatedBy", "contactRatedByName",
+  "nextFollowUpRemarks",
   "documentDelayRemarks", "documentDelayRemarksAt", "documentDelayRemarksBy", "documentDelayRemarksByName",
   "stageEnteredAt", "daysInStage", "convertedCustomerId",
   "convertedAt", "isArchived", "archivedAt", "ageDays", "attention", "createdAt", "updatedAt",
@@ -651,7 +657,10 @@ export class LeadsRepository {
         },
         contact_rated_by=${
           in_.contactRatedBy !== undefined ? in_.contactRatedBy : cur.contactRatedBy
-        }::uuid
+        }::uuid,
+        next_follow_up_remarks=${
+          in_.nextFollowUpRemarks !== undefined ? in_.nextFollowUpRemarks.trim() : cur.nextFollowUpRemarks
+        }
       WHERE id=${id}`.execute(this.db);
     return this.get(id);
   }
@@ -866,13 +875,12 @@ export class LeadsService {
     if (isSe || !input.ownerUserId) input.ownerUserId = claims.userId;
     if (claims.teamIds.length > 0 && (!input.teamId || isSe)) input.teamId = claims.teamIds[0];
 
-    const name = input.fullName.trim();
-    // Phone duplicates are handled asynchronously; only email/name soft-block create.
+    // Soft-block only on email. Phone is async; same-name leads are common and must not block create.
     const dups = (
       await internal("failed to check duplicates", () =>
-        this.repo.findDuplicates("", normalizeEmail(input.email), null, name, duplicateScopeFor(claims)),
+        this.repo.findDuplicates("", normalizeEmail(input.email), null, null, duplicateScopeFor(claims)),
       )
-    ).filter((d) => d.reason !== "phone");
+    ).filter((d) => d.reason === "email");
     if (dups.length > 0 && !input.forceCreate) return { duplicates: dups, needsReview: true };
 
     const nextAt = nextActivity(input.nextActivityAt);
@@ -984,6 +992,14 @@ export class LeadsService {
       in_.contactRemarks = nextRemarks;
       in_.contactRatedBy = actorId;
     }
+    if (in_.nextFollowUpRemarks !== undefined) {
+      const next = in_.nextFollowUpRemarks.trim();
+      const issue = nextFollowUpRemarksProblem(next);
+      // Allow clearing only when the lead is not on a Contacted→Lost stage.
+      if (issue && requiresNextFollowUpRemarks(cur.stageName)) throw AppError.validation(issue);
+      if (next.length > 2000) throw AppError.validation("Keep next follow-up remarks under 2,000 characters");
+      in_.nextFollowUpRemarks = next;
+    }
     const curOwner = cur.ownerUserId ?? "";
     const curTeam = cur.teamId ?? "";
     const newOwner = in_.ownerUserId !== undefined ? in_.ownerUserId.trim() : curOwner;
@@ -992,13 +1008,16 @@ export class LeadsService {
       assignTargetInScope(claims, newOwner !== curOwner ? newOwner : "", newTeam !== curTeam ? newTeam : "");
     }
 
-    // Phone duplicates are async; email/name soft-block remains.
-    const dups = (
-      await internal("failed to check duplicates", () =>
-        this.repo.findDuplicates(id, email, null, name, duplicateScopeFor(claims)),
-      )
-    ).filter((d) => d.reason !== "phone");
-    if (dups.length > 0 && !in_.forceUpdate) return { duplicates: dups, needsReview: true };
+    // Soft-block only when email is changing and already belongs to another record.
+    // Unrelated edits (notes, stage fields, same name as someone else) must not 409.
+    if (in_.email !== undefined && !in_.forceUpdate) {
+      const dups = (
+        await internal("failed to check duplicates", () =>
+          this.repo.findDuplicates(id, email, null, null, duplicateScopeFor(claims)),
+        )
+      ).filter((d) => d.reason === "email");
+      if (dups.length > 0) return { duplicates: dups, needsReview: true };
+    }
 
     const status = in_.status?.trim() ?? "";
     if (status !== "" && status !== cur.status) {
@@ -1058,6 +1077,8 @@ export class LeadsService {
               createdAt: cur.createdAt,
               contactRating: in_.contactRating !== undefined ? in_.contactRating : cur.contactRating,
               contactRemarks: in_.contactRemarks !== undefined ? in_.contactRemarks.trim() : cur.contactRemarks,
+              nextFollowUpRemarks:
+                in_.nextFollowUpRemarks !== undefined ? in_.nextFollowUpRemarks.trim() : cur.nextFollowUpRemarks,
             },
           )
         : null;

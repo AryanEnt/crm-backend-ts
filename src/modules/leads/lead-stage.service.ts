@@ -11,8 +11,10 @@ import { and, appendScope, effectiveScope, type Predicate, type Visibility } fro
 import { Records } from "../datascope/record.js";
 import { P } from "../permissions/permissions.js";
 import type { Pipeline, PipelinesRepository, Stage } from "../pipelines/pipelines.service.js";
+import { AttentionSql, validAttention } from "../attention/attention.js";
 import { TimelineEvent, TimelineService } from "../timeline/timeline.service.js";
 import { contactRemarksProblem, isContactedStage, parseContactRating } from "./contact-rating.js";
+import { nextFollowUpRemarksProblem, requiresNextFollowUpRemarks } from "./next-follow-up-remarks.js";
 
 /** The lead fields stage requirements and move rules look at. */
 export interface MovableLead {
@@ -38,6 +40,8 @@ export interface MovableLead {
   /** Contacted-stage star rating (1–5); null until set. */
   contactRating: number | null;
   contactRemarks: string;
+  /** Next follow-up plan; required on Contacted → Lost. */
+  nextFollowUpRemarks: string;
 }
 
 export interface MoveLeadInput {
@@ -144,6 +148,7 @@ export interface BoardCard {
   negotiationRemarks: string;
   contactRating: number | null;
   contactRemarks: string;
+  nextFollowUpRemarks: string;
   /** Earliest open document send deadline for this lead (Nurturing chase). */
   documentDeadlineAt: Date | null;
   /** Latest overdue document-delay remark (empty when none). */
@@ -194,6 +199,8 @@ export interface BoardFilter {
   country: string;
   /** overdue | today | week | none | scheduled */
   activity: string;
+  /** over_sla | overdue_next | no_next_activity | … — empty is any */
+  attention?: string;
   minValue?: number | null;
   maxValue?: number | null;
   scope: Visibility;
@@ -373,7 +380,8 @@ const MOVABLE_SELECT = sql`
     l.source, l.priority, l.notes, l.employer, l.potential_value AS "potentialValue",
     CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
     l.status, l.is_archived AS "isArchived", l.stage_entered_at AS "stageEnteredAt", l.created_at AS "createdAt",
-    l.contact_rating AS "contactRating", COALESCE(l.contact_remarks, '') AS "contactRemarks"
+    l.contact_rating AS "contactRating", COALESCE(l.contact_remarks, '') AS "contactRemarks",
+    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks"
   FROM leads l
   LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id`;
 
@@ -576,6 +584,22 @@ export class LeadStageService {
     }
 
     const force = in_.force === true;
+
+    // Contacted → Lost need a documented next follow-up plan (hard gate — force does not skip).
+    if (requiresNextFollowUpRemarks(toStage.name) || requiresNextFollowUpRemarks(lead.stageName)) {
+      const followUpIssue = nextFollowUpRemarksProblem(lead.nextFollowUpRemarks ?? "");
+      if (followUpIssue) {
+        throw AppError.validation(followUpIssue, {
+          reason: "next_follow_up_remarks_required",
+          missingFields: ["next_follow_up_remarks"],
+          missingActivities: [],
+          missingDocuments: [],
+          stageId: toStage.id,
+          stageName: toStage.name,
+        });
+      }
+    }
+
     if (!force) {
       const [customValues, missingActivities, missingDocuments] = await Promise.all([
         this.customFieldPresence(lead.id, toStage.requiredFields),
@@ -878,6 +902,7 @@ export class LeadStageService {
 
   private boardWhere(f: Omit<BoardFilter, "limit">, opts: { pipelineScoped?: boolean } = {}): Predicate[] {
     if (!VALID_ACTIVITY_FILTERS.has(f.activity)) throw AppError.validation("invalid activity filter");
+    if (!validAttention(f.attention ?? "")) throw AppError.validation("invalid attention");
     const pipelineScoped = opts.pipelineScoped !== false;
     const where: Predicate[] = [sql`l.is_archived = FALSE`];
     if (pipelineScoped) where.push(sql`l.pipeline_id::text = ${f.pipelineId}`);
@@ -901,6 +926,8 @@ export class LeadStageService {
     }
     const activity = leadActivityPredicate(f.activity);
     if (activity) where.push(activity);
+    const attention = f.attention?.trim() ?? "";
+    if (attention !== "") where.push(sql`(${sql.raw(AttentionSql.lead)}) = ${attention}`);
     where.push(...leadValuePredicates(f.minValue, f.maxValue));
     return appendScope(where, f.scope, Records.Leads.columns);
   }
@@ -944,6 +971,7 @@ export class LeadStageService {
           COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
           l.contact_rating AS "contactRating",
           COALESCE(l.contact_remarks, '') AS "contactRemarks",
+          COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
           dd.deadline AS "documentDeadlineAt",
           COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
           l.document_delay_remarks_at AS "documentDelayRemarksAt",
@@ -951,6 +979,7 @@ export class LeadStageService {
             PARTITION BY l.stage_id ORDER BY ${orderBy}
           ) AS rn
         FROM leads l
+        LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
         LEFT JOIN users ou ON ou.id = l.owner_user_id
         LEFT JOIN LATERAL (
           SELECT COALESCE(NULLIF(a.title, ''), NULLIF(a.subject, ''), t.name, 'Follow up') AS title, t.code AS type_code
@@ -996,10 +1025,12 @@ export class LeadStageService {
         COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
         l.contact_rating AS "contactRating",
         COALESCE(l.contact_remarks, '') AS "contactRemarks",
+        COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
         dd.deadline AS "documentDeadlineAt",
         COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
         l.document_delay_remarks_at AS "documentDelayRemarksAt"
       FROM leads l
+      LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
       LEFT JOIN users ou ON ou.id = l.owner_user_id
       LEFT JOIN LATERAL (
         SELECT COALESCE(NULLIF(a.title, ''), NULLIF(a.subject, ''), t.name, 'Follow up') AS title, t.code AS type_code
@@ -1036,14 +1067,18 @@ export class LeadStageService {
       internal("failed to load board", () =>
         sql<{ stageId: string | null; count: number; totalValue: number }>`
           SELECT l.stage_id::text AS "stageId", COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
-          FROM leads l WHERE ${and(where)} GROUP BY l.stage_id`.execute(this.db),
+          FROM leads l
+          LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+          WHERE ${and(where)} GROUP BY l.stage_id`.execute(this.db),
       ),
       internal("failed to load board", () => this.cards(where, limit, 0, sort, order)),
       wonWhere
         ? internal("failed to load won totals", () =>
             sql<{ count: number; totalValue: number }>`
               SELECT COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
-              FROM leads l WHERE ${and(wonWhere)}`.execute(this.db),
+              FROM leads l
+              LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+              WHERE ${and(wonWhere)}`.execute(this.db),
           )
         : Promise.resolve(null),
       wonWhere

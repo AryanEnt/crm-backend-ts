@@ -1,6 +1,6 @@
 import type { Request, Response, Router } from "express";
 import { z } from "zod";
-import { atoi, queryParam } from "../../lib/query.js";
+import { atoi, parseBool, queryParam } from "../../lib/query.js";
 import { readBody } from "../../lib/raw-body.js";
 import { pathParam, requestMetaFirstHopWithPort } from "../../lib/request-meta.js";
 import { AppError } from "../../lib/app-error.js";
@@ -328,7 +328,7 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
   });
 
   router.get("/api/v1/email/templates", ...guard(P.EmailView, P.EmailManage), async (req, res) => {
-    ok(res, await service.listTemplates(claimsOf(req)));
+    ok(res, await service.listTemplates(claimsOf(req), parseBool(queryParam(req, "includeInactive"))));
   });
 
   router.post("/api/v1/email/templates", ...guard(P.EmailManage), jsonBody, async (req, res) => {
@@ -338,11 +338,11 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
 
   router.patch("/api/v1/email/templates/:id", ...guard(P.EmailManage), jsonBody, async (req, res) => {
     const in_ = decodeJson(req, templateSchema);
-    ok(res, await service.updateTemplate(pathParam(req, "id"), in_));
+    ok(res, await service.updateTemplate(claimsOf(req), pathParam(req, "id"), in_));
   });
 
   router.delete("/api/v1/email/templates/:id", ...guard(P.EmailManage), async (req, res) => {
-    await service.deleteTemplate(pathParam(req, "id"));
+    await service.deleteTemplate(claimsOf(req), pathParam(req, "id"));
     ok(res, { deleted: true });
   });
 

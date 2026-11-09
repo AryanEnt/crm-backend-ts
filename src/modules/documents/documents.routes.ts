@@ -84,23 +84,33 @@ function isOutcomeLetterType(type: string, category: string): boolean {
   return t === "outcome_letter" || c === "outcome_letter";
 }
 
+/** Sales Negotiation → Purchased → Lost card documents (PDF / JPG / PNG). */
+function isPipelineLeadDocType(type: string, category: string): boolean {
+  const t = type.trim().toLowerCase();
+  const c = category.trim().toLowerCase();
+  return t === "lead_document" || c === "pipeline";
+}
+
 function isSeLeadCardDocType(type: string, category: string): boolean {
   return (
     isScreenshotType(type, category) ||
     isDeliveredFileType(type, category) ||
-    isOutcomeLetterType(type, category)
+    isOutcomeLetterType(type, category) ||
+    isPipelineLeadDocType(type, category)
   );
 }
 
 const CARD_DOC_MIMES = new Set(["application/pdf", "image/jpeg", "image/jpg", "image/png"]);
 
-/** PDF / JPG / PNG for File Delivered ("file received") and Outcome letter uploads. */
+/** PDF / JPG / PNG for File Delivered, Outcome letter, and pipeline lead-card uploads. */
 function assertCardDocMime(type: string, category: string, mimeType: string, filename: string) {
   const label = isOutcomeLetterType(type, category)
     ? "Outcome letter"
     : isDeliveredFileType(type, category)
       ? "File received"
-      : null;
+      : isPipelineLeadDocType(type, category)
+        ? "Document"
+        : null;
   if (!label) return;
   const mime = (mimeType.split(";")[0] ?? "").trim().toLowerCase();
   const ext = filename.includes(".") ? (filename.split(".").pop() ?? "").toLowerCase() : "";
@@ -132,8 +142,8 @@ async function requireParents(
 }
 
 /**
- * SE may upload screenshots, File Delivered docs, or Outcome letters onto leads they can edit;
- * TL/admin use documents:create.
+ * SE may upload screenshots, File Delivered docs, Outcome letters, or pipeline
+ * lead documents onto leads they can edit; TL/admin use documents:create.
  */
 async function assertCanUploadNew(
   db: Database,
@@ -158,7 +168,7 @@ async function assertCanUploadNew(
   throw AppError.forbidden("insufficient permissions");
 }
 
-/** SE may replace screenshot / delivered-file / outcome-letter uploads on leads they can edit. */
+/** SE may replace screenshot / delivered-file / outcome-letter / pipeline lead-doc uploads on leads they can edit. */
 async function assertCanUploadExisting(
   db: Database,
   claims: Claims,
@@ -299,7 +309,7 @@ export function documentsRouter(service: DocumentsService, db: Database, guard: 
     if (hasPerm(claims, P.DocumentsDelete)) {
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsDelete);
     } else if (claims.roleCode === Role.SalesExecutive) {
-      // SE may remove screenshots / delivered files / outcome letters on leads they can edit.
+      // SE may remove screenshots / delivered files / outcome letters / pipeline lead docs on leads they can edit.
       await requireRecord(db, claims, Records.Documents, id, P.DocumentsView);
       const doc = await service.get(id);
       if (!doc.leadId || !isSeLeadCardDocType(doc.type, doc.category)) {

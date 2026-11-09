@@ -189,7 +189,7 @@ describe("lead create phone validation gate", () => {
   it("does not soft-block create on phone-only duplicate matches", async () => {
     const f = fakeDb();
     queueAuth(f, P.LeadsCreate);
-    // findDuplicates with phone=null → only email/name; empty
+    // findDuplicates with phone=null and name=null → email-only soft-block path; empty
     f.queue([]);
     for (let i = 0; i < 30; i++) f.queue([]);
 
