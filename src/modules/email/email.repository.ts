@@ -132,6 +132,7 @@ export interface Template {
   name: string;
   subject: string;
   bodyHtml: string;
+  signatureHtml: string;
   category: string;
   variables: string[];
   isActive: boolean;
@@ -302,7 +303,8 @@ const messageSelect = sql`
   FROM email_messages m`;
 
 const templateSelect = sql`
-  SELECT id::text AS "id", name, subject, body_html AS "bodyHtml", category, variables, is_active AS "isActive",
+  SELECT id::text AS "id", name, subject, body_html AS "bodyHtml", signature_html AS "signatureHtml",
+    category, variables, is_active AS "isActive",
     created_by::text AS "createdBy", team_id::text AS "teamId", created_at AS "createdAt", updated_at AS "updatedAt"
   FROM email_templates`;
 
@@ -323,7 +325,11 @@ const toMessage = (m: Omit<Message, "attachments">): Message => ({
   attachments: null,
 });
 
-const toTemplate = (t: Template): Template => ({ ...t, variables: t.variables ?? [] });
+const toTemplate = (t: Template): Template => ({
+  ...t,
+  signatureHtml: t.signatureHtml ?? "",
+  variables: t.variables ?? [],
+});
 
 /** Visibility of email threads for the caller (owner-only rows unless linked to the CRM). */
 function threadScope(claims: Claims, ownerUserId: string): Predicate[] {
@@ -868,12 +874,19 @@ export class EmailRepository {
     return r.rows;
   }
 
-  async listTemplates(teamIds: string[]): Promise<Template[]> {
-    const r = await sql<Template>`
-      ${templateSelect}
-      WHERE is_active=TRUE
-        AND (team_id IS NULL OR team_id = ANY(${teamIds}::uuid[]) OR cardinality(${teamIds}::uuid[])=0)
-      ORDER BY name`.execute(this.db);
+  async listTemplates(teamIds: string[] | null, activeOnly = true): Promise<Template[]> {
+    if (teamIds !== null && teamIds.length === 0) return [];
+    const activeClause = activeOnly ? sql`AND is_active=TRUE` : sql``;
+    const r =
+      teamIds === null
+        ? await sql<Template>`
+            ${templateSelect}
+            WHERE TRUE ${activeClause}
+            ORDER BY is_active DESC, name`.execute(this.db)
+        : await sql<Template>`
+            ${templateSelect}
+            WHERE team_id = ANY(${teamIds}::uuid[]) ${activeClause}
+            ORDER BY is_active DESC, name`.execute(this.db);
     return r.rows.map(toTemplate);
   }
 
@@ -884,16 +897,17 @@ export class EmailRepository {
 
   async insertTemplate(t: Omit<Template, "id" | "createdAt" | "updatedAt">): Promise<Template | null> {
     const r = await sql<{ id: string }>`
-      INSERT INTO email_templates (id, name, subject, body_html, category, variables, is_active, created_by, team_id)
-      VALUES (${randomUUID()}, ${t.name}, ${t.subject}, ${t.bodyHtml}, ${t.category}, ${t.variables}, ${t.isActive},
-        ${t.createdBy}, ${t.teamId})
+      INSERT INTO email_templates (id, name, subject, body_html, signature_html, category, variables, is_active, created_by, team_id)
+      VALUES (${randomUUID()}, ${t.name}, ${t.subject}, ${t.bodyHtml}, ${t.signatureHtml}, ${t.category}, ${t.variables},
+        ${t.isActive}, ${t.createdBy}, ${t.teamId})
       RETURNING id::text AS "id"`.execute(this.db);
     return this.getTemplate(r.rows[0]!.id);
   }
 
   async updateTemplate(t: Template): Promise<Template | null> {
     await sql`
-      UPDATE email_templates SET name=${t.name}, subject=${t.subject}, body_html=${t.bodyHtml}, category=${t.category},
+      UPDATE email_templates SET name=${t.name}, subject=${t.subject}, body_html=${t.bodyHtml},
+        signature_html=${t.signatureHtml}, category=${t.category},
         variables=${t.variables}, is_active=${t.isActive}, team_id=${t.teamId}, updated_at=NOW()
       WHERE id=${t.id}`.execute(this.db);
     return this.getTemplate(t.id);

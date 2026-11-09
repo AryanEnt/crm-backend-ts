@@ -33,9 +33,8 @@ export function slaExceededCopy(input: {
   const over = Math.max(1, inStage - limit);
   const stage = input.stageName.trim() || "this stage";
   const lead = input.leadName.trim() || "this lead";
-  const limitAdj = limit === 1 ? "1-day" : `${limit}-day`;
   return {
-    title: "Lead SLA exceeded",
-    body: `${lead} has remained in ${stage} for ${dayLabel(inStage)}, exceeding its ${limitAdj} SLA by ${dayLabel(over)}.`,
+    title: "Lead stuck too long in a stage",
+    body: `${lead} has been in ${stage} for ${dayLabel(inStage)}. The limit for that stage is ${dayLabel(limit)} (${dayLabel(over)} overdue). Please follow up.`,
   };
 }

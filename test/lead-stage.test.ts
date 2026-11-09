@@ -7,6 +7,8 @@ import {
   assertLeadEditable,
   LeadStageService,
   missingLeadFields,
+  parseBoardOrder,
+  parseBoardSort,
   parseClosingAmount,
   statusForStage,
   type MovableLead,
@@ -88,6 +90,9 @@ const movable = (extra: Partial<MovableLead> = {}): MovableLead => ({
   isArchived: false,
   stageEnteredAt: new Date(Date.now() - 3_600_000),
   createdAt: new Date(Date.now() - 7_200_000),
+  contactRating: null,
+  contactRemarks: "",
+  nextFollowUpRemarks: "",
   ...extra,
 });
 
@@ -168,7 +173,7 @@ describe("LeadStageService.move", () => {
     const { f, svc } = service();
     f.queue([lead()]);
     const err = await rejection(svc.move(user, "lead-1", { stageId: WON.id }, META));
-    expect(err.message).toBe("Set a document send deadline before marking Won");
+    expect(err.message).toBe("Set a document send deadline before marking Purchased");
     expect(err.details).toMatchObject({ reason: "document_deadline_required", missingDocuments: ["send_deadline"] });
     expect(f.queries).toHaveLength(1);
   });
@@ -230,7 +235,7 @@ describe("LeadStageService.move", () => {
     const { f, svc } = service();
     f.queue([lead({ status: "won", stageId: WON.id, stageName: "Won" })]);
     const err = await rejection(svc.move(user, "lead-1", { stageId: PROPOSAL.id }, META));
-    expect(err.message).toBe("Lead is closed as Won; reopen it to move");
+    expect(err.message).toBe("Lead is closed as Purchased; reopen it to move");
     expect(err.details).toEqual({ reason: "lead_closed", status: "won" });
     expect(f.queries).toHaveLength(1);
   });
@@ -238,7 +243,14 @@ describe("LeadStageService.move", () => {
   it("reopening clears the outcome and records the reopen", async () => {
     const { f, svc } = service();
     f.queue(
-      [lead({ status: "lost", stageId: LOST.id, stageName: "Lost" })],
+      [
+        lead({
+          status: "lost",
+          stageId: LOST.id,
+          stageName: "Lost",
+          nextFollowUpRemarks: "Retry after budget cycle",
+        }),
+      ],
       [],
       [],
       [],
@@ -255,8 +267,110 @@ describe("LeadStageService.move", () => {
 
   it("Lost requires a reason", async () => {
     const { f, svc } = service();
-    f.queue([lead()]);
+    f.queue([lead({ nextFollowUpRemarks: "Closed out after no reply" })]);
     expect((await rejection(svc.move(user, "lead-1", { stageId: LOST.id }, META))).message).toBe("lost reason is required");
+  });
+
+  it("blocks leaving Contacted until star rating and remarks are set", async () => {
+    const CONTACTED = stage("s-contacted", "Contacted", { position: 2 });
+    const NEGOTIATION = stage("s-negotiation", "Negotiation", { position: 3 });
+    const pipe: Pipeline = {
+      ...PIPELINE,
+      stages: [CREATED, CONTACTED, NEGOTIATION, WON, LOST],
+    };
+    const pipelines = {
+      get: async (id: string) => (id === pipe.id ? pipe : null),
+      getStage: async (id: string) =>
+        [CREATED, CONTACTED, NEGOTIATION, WON, LOST, INACTIVE, FOREIGN].find((s) => s.id === id) ?? null,
+    } as unknown as PipelinesRepository;
+    const f = fakeDb();
+    const svc = new LeadStageService(f.db as unknown as Database, pipelines, null, vi.fn());
+
+    f.queue([lead({ stageId: CONTACTED.id, stageName: "Contacted" })]);
+    const missing = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(missing.message).toMatch(/star rating/i);
+    expect(missing.details).toMatchObject({ reason: "contact_rating_required" });
+
+    f.queue([
+      lead({
+        stageId: CONTACTED.id,
+        stageName: "Contacted",
+        contactRating: 4,
+        contactRemarks: "good good good good good",
+      }),
+    ]);
+    const repeats = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(repeats.message).toMatch(/different words/i);
+
+    f.queue([
+      lead({
+        stageId: CONTACTED.id,
+        stageName: "Contacted",
+        contactRating: 4,
+        contactRemarks: "spoke about budget timeline and next steps",
+      }),
+    ]);
+    const followUp = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(followUp.message).toMatch(/follow-up remarks/i);
+    expect(followUp.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
+    f.queue(
+      [
+        lead({
+          stageId: CONTACTED.id,
+          stageName: "Contacted",
+          contactRating: 4,
+          contactRemarks: "spoke about budget timeline and next steps",
+          nextFollowUpRemarks: "Call Thursday with fee options",
+        }),
+      ],
+      [],
+      [],
+      [],
+      [{ id: "t1", metadata: {} }],
+      [],
+      [],
+      [{ status: "open", nextActivityAt: null }],
+    );
+    const out = await svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META);
+    expect(out.changed).toBe(true);
+  });
+
+  it("blocks entering Contacted without next follow-up remarks; force cannot skip", async () => {
+    const CONTACTED = stage("s-contacted", "Contacted", { position: 2 });
+    const pipe: Pipeline = {
+      ...PIPELINE,
+      stages: [CREATED, CONTACTED, WON, LOST],
+    };
+    const pipelines = {
+      get: async (id: string) => (id === pipe.id ? pipe : null),
+      getStage: async (id: string) =>
+        [CREATED, CONTACTED, WON, LOST, INACTIVE, FOREIGN].find((s) => s.id === id) ?? null,
+    } as unknown as PipelinesRepository;
+    const f = fakeDb();
+    const svc = new LeadStageService(f.db as unknown as Database, pipelines, null, vi.fn());
+
+    f.queue([lead({ stageId: CREATED.id, stageName: "Leads" })]);
+    const missing = await rejection(svc.move(user, "lead-1", { stageId: CONTACTED.id }, META));
+    expect(missing.message).toMatch(/follow-up remarks/i);
+    expect(missing.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
+    f.queue([lead({ stageId: CREATED.id, stageName: "Leads" })]);
+    const forced = await rejection(svc.move(user, "lead-1", { stageId: CONTACTED.id, force: true }, META));
+    expect(forced.details).toMatchObject({ reason: "next_follow_up_remarks_required" });
+
+    f.queue(
+      [lead({ stageId: CREATED.id, stageName: "Leads", nextFollowUpRemarks: "Send brochure Monday" })],
+      [],
+      [],
+      [],
+      [{ id: "t1", metadata: {} }],
+      [],
+      [],
+      [{ status: "open", nextActivityAt: null }],
+    );
+    const ok = await svc.move(user, "lead-1", { stageId: CONTACTED.id }, META);
+    expect(ok.changed).toBe(true);
   });
 
   it("rejects inactive stages and stages from another pipeline", async () => {
@@ -328,19 +442,19 @@ describe("LeadStageService.board", () => {
 
   it("groups capped cards under active stages with per-stage totals", async () => {
     const { f, svc } = service();
+    // Board runs four queries in parallel: stage totals, stage cards, won_at totals, won_at cards.
     f.queue(
-      [
-        { stageId: CREATED.id, count: 3, totalValue: 300 },
-        { stageId: WON.id, count: 1, totalValue: 100 },
-      ],
-      [card("a", CREATED.id), card("w", WON.id)],
+      [{ stageId: CREATED.id, count: 3, totalValue: 300 }],
+      [card("a", CREATED.id)],
+      [{ count: 1, totalValue: 100 }],
+      [{ ...card("w", WON.id), wonAt: new Date("2026-01-01") }],
     );
     const board = await svc.board(filter);
     expect(board.pipeline).toEqual({ id: PIPE, name: "Lead Pipeline", kind: "leads", isDefault: true });
     expect(board.stages.map((s) => s.name)).toEqual(["Created", "Proposal", "Won", "Lost"]);
     expect(board.stages[0]).toMatchObject({ count: 3, totalValue: 300, hasMore: true, leads: [card("a", CREATED.id)] });
     expect(board.stages[1]).toMatchObject({ count: 0, totalValue: 0, hasMore: false, leads: [] });
-    expect(board.stages[2]).toMatchObject({ count: 1, hasMore: false });
+    expect(board.stages[2]).toMatchObject({ count: 1, totalValue: 100, hasMore: false });
     expect(sqlOf(f)[1]).toContain("ROW_NUMBER() OVER ( PARTITION BY l.stage_id");
   });
 
@@ -370,6 +484,28 @@ describe("LeadStageService.board", () => {
     f.queue([card("b", CREATED.id), card("c", CREATED.id)]);
     expect(await svc.boardStage({ ...filter, limit: 1 }, CREATED.id, 1)).toEqual({ leads: [card("b", CREATED.id)], hasMore: true });
     expect(f.queries[0]!.parameters.slice(-2)).toEqual([1, 3]);
+  });
+
+  it("orders column cards by the requested board sort", async () => {
+    const { f, svc } = service();
+    f.queue([], [], [], []);
+    await svc.board({ ...filter, sort: "value", order: "asc" });
+    expect(sqlOf(f).some((q) => q.includes("l.potential_value ASC"))).toBe(true);
+
+    const again = service();
+    again.f.queue([card("b", CREATED.id)]);
+    await again.svc.boardStage({ ...filter, sort: "priority", order: "desc" }, CREATED.id, 0);
+    expect(sqlOf(again.f)[0]).toContain("WHEN 'urgent' THEN 4");
+  });
+});
+
+describe("board sort helpers", () => {
+  it("parses known keys and falls back safely", () => {
+    expect(parseBoardSort("time")).toBe("time");
+    expect(parseBoardSort("priority")).toBe("priority");
+    expect(parseBoardSort("nope")).toBe("days");
+    expect(parseBoardOrder("ASC")).toBe("asc");
+    expect(parseBoardOrder("")).toBe("desc");
   });
 });
 
@@ -513,5 +649,156 @@ describe("lead routes", () => {
       .get(`/api/v1/pipelines/${PIPE}`)
       .set("Authorization", bearer());
     expect(res.status).toBe(403);
+  });
+});
+
+describe("LeadStageService.listHistory", () => {
+  const t0 = new Date("2026-10-15T03:45:00.000Z");
+  const t1 = new Date("2026-10-16T08:30:00.000Z");
+  const t2 = new Date("2026-10-18T05:15:00.000Z");
+
+  it("turns transitions into oldest-first stage periods with a live current duration", async () => {
+    const { f, svc } = service();
+    f.queue(
+      [lead({ stageId: PROPOSAL.id, stageName: "Proposal", stageEnteredAt: t2 })],
+      [
+        {
+          id: "tr-1",
+          leadId: "lead-1",
+          fromPipelineId: null,
+          fromStageId: null,
+          fromStageName: null,
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: null,
+          enteredAt: t0,
+          durationSeconds: null,
+          metadata: { kind: "created" },
+          createdAt: t0,
+        },
+        {
+          id: "tr-2",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: CREATED.id,
+          fromStageName: "Created",
+          toPipelineId: PIPE,
+          toStageId: PROPOSAL.id,
+          toStageName: "Proposal",
+          actorUserId: "u2",
+          actorName: "Ram",
+          fromStageEnteredAt: t0,
+          enteredAt: t1,
+          durationSeconds: Math.trunc((t1.getTime() - t0.getTime()) / 1000),
+          metadata: {},
+          createdAt: t1,
+        },
+      ],
+    );
+
+    const { periods, serverNow } = await svc.listHistory("lead-1");
+    expect(serverNow).toBeInstanceOf(Date);
+    expect(periods).toHaveLength(2);
+    expect(periods[0]).toMatchObject({
+      stageName: "Created",
+      enteredAt: t0,
+      exitedAt: t1,
+      movedToStageName: "Proposal",
+      enteredByName: "Asha",
+      exitedByName: "Ram",
+      isCurrent: false,
+      kind: "created",
+      durationSeconds: Math.trunc((t1.getTime() - t0.getTime()) / 1000),
+    });
+    expect(periods[1]).toMatchObject({
+      stageName: "Proposal",
+      enteredAt: t1,
+      exitedAt: null,
+      movedToStageName: null,
+      enteredByName: "Ram",
+      isCurrent: true,
+    });
+    expect(periods[1]!.durationSeconds).toBeGreaterThanOrEqual(Math.trunc((Date.now() - t1.getTime()) / 1000) - 2);
+  });
+
+  it("falls back to the lead's current stage when there are no transitions", async () => {
+    const { f, svc } = service();
+    f.queue([lead({ stageEnteredAt: t0 })], []);
+    const { periods } = await svc.listHistory("lead-1");
+    expect(periods).toHaveLength(1);
+    expect(periods[0]).toMatchObject({
+      stageName: "Created",
+      enteredAt: t0,
+      exitedAt: null,
+      isCurrent: true,
+      kind: "current",
+    });
+  });
+
+  it("moving back to an earlier stage creates a new period instead of rewriting the old one", async () => {
+    const { f, svc } = service();
+    f.queue(
+      [lead()],
+      [
+        {
+          id: "a",
+          leadId: "lead-1",
+          fromPipelineId: null,
+          fromStageId: null,
+          fromStageName: null,
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: null,
+          enteredAt: t0,
+          durationSeconds: null,
+          metadata: { kind: "created" },
+          createdAt: t0,
+        },
+        {
+          id: "b",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: CREATED.id,
+          fromStageName: "Created",
+          toPipelineId: PIPE,
+          toStageId: PROPOSAL.id,
+          toStageName: "Proposal",
+          actorUserId: "u1",
+          actorName: "Asha",
+          fromStageEnteredAt: t0,
+          enteredAt: t1,
+          durationSeconds: 1000,
+          metadata: {},
+          createdAt: t1,
+        },
+        {
+          id: "c",
+          leadId: "lead-1",
+          fromPipelineId: PIPE,
+          fromStageId: PROPOSAL.id,
+          fromStageName: "Proposal",
+          toPipelineId: PIPE,
+          toStageId: CREATED.id,
+          toStageName: "Created",
+          actorUserId: "u2",
+          actorName: "Ram",
+          fromStageEnteredAt: t1,
+          enteredAt: t2,
+          durationSeconds: 2000,
+          metadata: {},
+          createdAt: t2,
+        },
+      ],
+    );
+    const { periods } = await svc.listHistory("lead-1");
+    expect(periods.map((p) => p.stageName)).toEqual(["Created", "Proposal", "Created"]);
+    expect(periods[0]!.isCurrent).toBe(false);
+    expect(periods[2]).toMatchObject({ stageName: "Created", isCurrent: true, enteredByName: "Ram" });
   });
 });

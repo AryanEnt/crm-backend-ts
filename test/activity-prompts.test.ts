@@ -61,6 +61,18 @@ describe("promptTarget", () => {
     expect(promptTarget([stage("a", "New", 1)], "a", PromptResult.Contacted)).toBeNull();
   });
 
+  it("maps Qualified onto Negotiation after the Leads pipeline rename", () => {
+    const leads = [
+      stage("s-leads", "Leads", 1),
+      CONTACTED,
+      stage("s-neg", "Negotiation", 3),
+      stage("s-purchased", "Purchased", 4, { isWon: true }),
+      LOST,
+    ];
+    expect(promptTarget(leads, "s-leads", PromptResult.Contacted)?.id).toBe(CONTACTED.id);
+    expect(promptTarget(leads, "s-leads", PromptResult.Qualified)?.id).toBe("s-neg");
+  });
+
   it("ignores inactive stages", () => {
     const stages = [COLD, { ...CONTACTED, isActive: false }, stage("s-call", "Called", 3)];
     expect(promptTarget(stages, COLD.id, PromptResult.Contacted)?.id).toBe("s-call");

@@ -19,6 +19,17 @@ import type { SystemActivityService } from "../system-activity/system-activity.s
 import { TimelineEvent, type TimelineService } from "../timeline/timeline.service.js";
 import type { FollowUpScheduler } from "./lead-stage.service.js";
 import { leadActivityPredicate, leadValuePredicates, type LeadStageService } from "./lead-stage.service.js";
+import {
+  contactRemarksProblem,
+  isContactedStage,
+  parseContactRating,
+} from "./contact-rating.js";
+import { nextFollowUpRemarksProblem, requiresNextFollowUpRemarks } from "./next-follow-up-remarks.js";
+import {
+  enqueuePhoneValidation,
+  PhoneValidationService,
+} from "./phone-validation.service.js";
+import type { PhoneValidationStatus } from "./phone-validation.js";
 
 export interface BulkStageResult {
   updated: number;
@@ -66,6 +77,23 @@ export interface Lead {
   wonAt: Date | null;
   lostAt: Date | null;
   lostReason: string;
+  /** Negotiation-stage category (empty when unset). */
+  negotiationTag: string;
+  /** Free-text note when negotiationTag is "Others". */
+  negotiationRemarks: string;
+  /** Contacted-stage star rating (1–5); null until set. Locked after leaving Contacted. */
+  contactRating: number | null;
+  contactRemarks: string;
+  contactRatedAt: Date | null;
+  contactRatedBy: string | null;
+  contactRatedByName: string | null;
+  /** Next follow-up plan; required on Contacted → Lost. */
+  nextFollowUpRemarks: string;
+  /** Latest overdue document-delay remark (Nurturing). */
+  documentDelayRemarks: string;
+  documentDelayRemarksAt: Date | null;
+  documentDelayRemarksBy: string | null;
+  documentDelayRemarksByName: string | null;
   stageEnteredAt: Date | null;
   daysInStage: number;
   convertedCustomerId: string | null;
@@ -76,6 +104,17 @@ export interface Lead {
   attention: string;
   createdAt: Date;
   updatedAt: Date;
+  createdByUserId: string | null;
+  phoneCountryCode: string;
+  phoneValidationStatus: PhoneValidationStatus;
+  phoneNormalized: string | null;
+  phoneValidationMessage: string;
+  /** Duplicate lead IDs the caller is allowed to see (redacted in attachVisibleDuplicates). */
+  phoneDuplicateLeadIds: string[];
+  phoneDuplicateLeads: { id: string; fullName: string }[];
+  phoneValidatedAt: Date | null;
+  phoneLastNotifiedAt: Date | null;
+  phoneValidationVersion: number;
 }
 
 export interface CreateLeadInput {
@@ -106,6 +145,8 @@ export interface CreateLeadInput {
   expectedOutcome: string;
   nextActivityAt?: string | undefined;
   forceCreate: boolean;
+  /** ISO 3166-1 alpha-2 used as the default region for phone parsing. */
+  phoneCountryCode?: string | undefined;
   customFields?: Record<string, unknown> | undefined;
   referral?: ReferralInput | undefined;
 }
@@ -142,11 +183,19 @@ export interface UpdateLeadInput {
   status?: string | undefined;
   /** Used when the PATCH moves the lead into a lost stage. */
   lostReason?: string | undefined;
+  negotiationTag?: string | undefined;
+  negotiationRemarks?: string | undefined;
+  contactRating?: number | undefined;
+  contactRemarks?: string | undefined;
+  nextFollowUpRemarks?: string | undefined;
+  /** Set by LeadsService when saving a Contacted rating. */
+  contactRatedBy?: string | null | undefined;
   /** Skips stage requirements when the PATCH moves the lead. */
   forceStage?: boolean | undefined;
   /** Allows the PATCH to move a Won or Lost lead. */
   reopen?: boolean | undefined;
   forceUpdate: boolean;
+  phoneCountryCode?: string | undefined;
   customFields?: Record<string, unknown> | undefined;
   referral?: ReferralInput | undefined;
 }
@@ -214,10 +263,11 @@ export interface BulkStageInput {
   stageId: string;
 }
 
-type LeadRow = Omit<Lead, "attention" | "tags" | "skills"> & {
+type LeadRow = Omit<Lead, "attention" | "tags" | "skills" | "phoneDuplicateLeadIds" | "phoneDuplicateLeads"> & {
   tags: string[] | null;
   skills: string[] | null;
   slaHours: number | null;
+  phoneDuplicateLeadIds: string[] | null;
 };
 
 const leadSelect = sql`
@@ -233,14 +283,37 @@ const leadSelect = sql`
     l.expected_outcome AS "expectedOutcome",
     l.last_activity_at AS "lastActivityAt", l.next_activity_at AS "nextActivityAt",
     l.status, l.won_at AS "wonAt", l.lost_at AS "lostAt", l.lost_reason AS "lostReason",
+    COALESCE(l.negotiation_tag, '') AS "negotiationTag",
+    COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
+    l.contact_rating AS "contactRating",
+    COALESCE(l.contact_remarks, '') AS "contactRemarks",
+    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
+    l.contact_rated_at AS "contactRatedAt",
+    l.contact_rated_by::text AS "contactRatedBy",
+    cr.full_name AS "contactRatedByName",
+    COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
+    l.document_delay_remarks_at AS "documentDelayRemarksAt",
+    l.document_delay_remarks_by::text AS "documentDelayRemarksBy",
+    dr.full_name AS "documentDelayRemarksByName",
     l.stage_entered_at AS "stageEnteredAt",
     GREATEST(0, EXTRACT(DAY FROM NOW() - COALESCE(l.stage_entered_at, l.created_at))::int) AS "daysInStage",
     l.converted_customer_id::text AS "convertedCustomerId", l.converted_at AS "convertedAt",
     l.is_archived AS "isArchived", l.archived_at AS "archivedAt",
     GREATEST(0, EXTRACT(DAY FROM NOW() - l.created_at)::int) AS "ageDays",
-    l.created_at AS "createdAt", l.updated_at AS "updatedAt", ps.sla_hours AS "slaHours"
+    l.created_at AS "createdAt", l.updated_at AS "updatedAt", ps.sla_hours AS "slaHours",
+    l.created_by_user_id::text AS "createdByUserId",
+    COALESCE(l.phone_country_code, '') AS "phoneCountryCode",
+    COALESCE(l.phone_validation_status, 'pending') AS "phoneValidationStatus",
+    l.phone_normalized AS "phoneNormalized",
+    COALESCE(l.phone_validation_message, '') AS "phoneValidationMessage",
+    COALESCE(l.phone_duplicate_lead_ids, '{}'::uuid[])::text[] AS "phoneDuplicateLeadIds",
+    l.phone_validated_at AS "phoneValidatedAt",
+    l.phone_last_notified_at AS "phoneLastNotifiedAt",
+    COALESCE(l.phone_validation_version, 0) AS "phoneValidationVersion"
   FROM leads l
   LEFT JOIN users ou ON ou.id = l.owner_user_id
+  LEFT JOIN users cr ON cr.id = l.contact_rated_by
+  LEFT JOIN users dr ON dr.id = l.document_delay_remarks_by
   LEFT JOIN teams t ON t.id = l.team_id
   LEFT JOIN anzsco_occupations a ON a.id = l.anzsco_id
   LEFT JOIN pipelines p ON p.id = l.pipeline_id
@@ -255,7 +328,17 @@ function toLead(r: LeadRow): Lead {
     createdAt: r.createdAt,
     slaHours: r.slaHours,
   });
-  return orderLead({ ...r, tags: r.tags ?? [], skills: r.skills ?? [], attention });
+  const ids = (r.phoneDuplicateLeadIds ?? []).map(String);
+  return orderLead({
+    ...r,
+    tags: r.tags ?? [],
+    skills: r.skills ?? [],
+    attention,
+    phoneDuplicateLeadIds: ids,
+    phoneDuplicateLeads: [],
+    phoneValidationStatus: (r.phoneValidationStatus || "pending") as PhoneValidationStatus,
+    phoneValidationVersion: Number(r.phoneValidationVersion ?? 0),
+  });
 }
 
 /** Go struct field order. */
@@ -264,13 +347,30 @@ const LEAD_KEYS: (keyof Lead)[] = [
   "teamName", "source", "priority", "tags", "anzscoId", "anzscoCode", "anzscoTitle", "pipelineId", "pipelineName",
   "stageId", "stageName", "stageAccent", "notes", "occupation", "jobTitle", "employer", "experienceYears", "qualification",
   "skills", "potentialValue", "currency", "probability", "expectedCloseAt", "expectedOutcome", "lastActivityAt",
-  "nextActivityAt", "status", "wonAt", "lostAt", "lostReason", "stageEnteredAt", "daysInStage", "convertedCustomerId",
+  "nextActivityAt", "status", "wonAt", "lostAt", "lostReason", "negotiationTag", "negotiationRemarks",
+  "contactRating", "contactRemarks", "contactRatedAt", "contactRatedBy", "contactRatedByName",
+  "nextFollowUpRemarks",
+  "documentDelayRemarks", "documentDelayRemarksAt", "documentDelayRemarksBy", "documentDelayRemarksByName",
+  "stageEnteredAt", "daysInStage", "convertedCustomerId",
   "convertedAt", "isArchived", "archivedAt", "ageDays", "attention", "createdAt", "updatedAt",
+  "createdByUserId", "phoneCountryCode", "phoneValidationStatus", "phoneNormalized", "phoneValidationMessage",
+  "phoneDuplicateLeadIds", "phoneDuplicateLeads", "phoneValidatedAt", "phoneLastNotifiedAt", "phoneValidationVersion",
 ];
 
 function orderLead(l: Lead & { slaHours?: unknown }): Lead {
   return Object.fromEntries(LEAD_KEYS.map((k) => [k, l[k]])) as unknown as Lead;
 }
+
+/** Allowed Negotiation-stage tags on the Leads Pipeline board. */
+export const NEGOTIATION_TAGS = [
+  "Budget Concern",
+  "Payment Scheduled",
+  "Gone Quiet",
+  "Follow-up Scheduled",
+  "Others",
+] as const;
+export type NegotiationTag = (typeof NEGOTIATION_TAGS)[number];
+const NEGOTIATION_TAG_SET = new Set<string>(NEGOTIATION_TAGS);
 
 /** Statuses with no further sales work; attention flags are not computed for them. */
 const CLOSED_LEAD_STATUSES = new Set(["won", "lost", "converted", "archived", "unqualified"]);
@@ -477,15 +577,18 @@ export class LeadsRepository {
     in_: CreateLeadInput,
     nextAt: Date | null,
     placement: { probability: number | null; closeDate: string | null },
+    createdByUserId: string,
   ): Promise<Lead | null> {
     const id = randomUUID();
+    const phoneCode = (in_.phoneCountryCode ?? "").trim().toUpperCase();
     await sql`
       INSERT INTO leads (
         id, full_name, email, phone, country, nationality, location,
         owner_user_id, team_id, source, priority, tags, anzsco_id,
         pipeline_id, stage_id, notes, occupation, job_title, employer,
         experience_years, qualification, skills, potential_value, currency, probability, expected_close_at,
-        expected_outcome, next_activity_at, last_activity_at, status, stage_entered_at
+        expected_outcome, next_activity_at, last_activity_at, status, stage_entered_at,
+        created_by_user_id, phone_country_code, phone_validation_status, phone_validation_message
       ) VALUES (
         ${id}, ${in_.fullName.trim()}, ${normalizeEmail(in_.email)}, ${normalizePhone(in_.phone)},
         ${in_.country}, ${in_.nationality}, ${in_.location},
@@ -494,9 +597,25 @@ export class LeadsRepository {
         ${nullIfBlank(in_.pipelineId)}, ${nullIfBlank(in_.stageId)}, ${in_.notes}, ${in_.occupation}, ${in_.jobTitle}, ${in_.employer},
         ${in_.experienceYears ?? null}, ${in_.qualification}, ${in_.skills ?? []}::text[], ${in_.potentialValue ?? null},
         ${in_.currency?.trim() || "AUD"}, ${placement.probability}, ${placement.closeDate}::date,
-        ${in_.expectedOutcome}, ${nextAt}, NOW(), 'open', NOW()
+        ${in_.expectedOutcome}, ${nextAt}, NOW(), 'open', NOW(),
+        ${createdByUserId}::uuid, ${phoneCode},
+        ${normalizePhone(in_.phone) ? "pending" : "valid"},
+        ${normalizePhone(in_.phone) ? "Queued for validation" : ""}
       )`.execute(this.db);
     return this.get(id);
+  }
+
+  async visibleLeadSummaries(
+    ids: string[],
+    scope: Visibility | null,
+  ): Promise<{ id: string; fullName: string }[]> {
+    if (ids.length === 0 || !scope) return [];
+    const rec = Records.Leads;
+    const where = appendScope([sql`l.id = ANY(${ids}::uuid[])`, sql`l.is_archived=FALSE`], scope, rec.columns);
+    const r = await sql<{ id: string; fullName: string }>`
+      SELECT l.id::text AS "id", l.full_name AS "fullName"
+      FROM leads l WHERE ${and(where)}`.execute(this.db);
+    return r.rows;
   }
 
   /** Field updates only: pipeline, stage and outcome columns belong to LeadStageService. */
@@ -515,6 +634,7 @@ export class LeadsRepository {
         full_name=${in_.fullName !== undefined ? in_.fullName.trim() : cur.fullName},
         email=${in_.email !== undefined ? normalizeEmail(in_.email) : cur.email},
         phone=${in_.phone !== undefined ? normalizePhone(in_.phone) : cur.phone},
+        phone_country_code=${in_.phoneCountryCode !== undefined ? in_.phoneCountryCode.trim().toUpperCase() : cur.phoneCountryCode},
         country=${pick(in_.country, cur.country)}, nationality=${pick(in_.nationality, cur.nationality)},
         location=${pick(in_.location, cur.location)},
         owner_user_id=${pickRef(in_.ownerUserId, cur.ownerUserId)}, team_id=${pickRef(in_.teamId, cur.teamId)},
@@ -527,7 +647,20 @@ export class LeadsRepository {
         currency=${in_.currency?.trim() || cur.currency},
         expected_close_at=${closeDate === undefined ? cur.expectedCloseAt : closeDate}::date,
         expected_outcome=${pick(in_.expectedOutcome, cur.expectedOutcome)},
-        next_activity_at=${nextAt === undefined ? cur.nextActivityAt : nextAt}, status=${pick(in_.status, cur.status)}
+        next_activity_at=${nextAt === undefined ? cur.nextActivityAt : nextAt}, status=${pick(in_.status, cur.status)},
+        negotiation_tag=${in_.negotiationTag !== undefined ? in_.negotiationTag.trim() : cur.negotiationTag},
+        negotiation_remarks=${in_.negotiationRemarks !== undefined ? in_.negotiationRemarks.trim() : cur.negotiationRemarks},
+        contact_rating=${in_.contactRating !== undefined ? in_.contactRating : cur.contactRating},
+        contact_remarks=${in_.contactRemarks !== undefined ? in_.contactRemarks.trim() : cur.contactRemarks},
+        contact_rated_at=${
+          in_.contactRating !== undefined || in_.contactRemarks !== undefined ? new Date() : cur.contactRatedAt
+        },
+        contact_rated_by=${
+          in_.contactRatedBy !== undefined ? in_.contactRatedBy : cur.contactRatedBy
+        }::uuid,
+        next_follow_up_remarks=${
+          in_.nextFollowUpRemarks !== undefined ? in_.nextFollowUpRemarks.trim() : cur.nextFollowUpRemarks
+        }
       WHERE id=${id}`.execute(this.db);
     return this.get(id);
   }
@@ -608,9 +741,10 @@ export class LeadsRepository {
 
 export class LeadsService {
   readonly repo: LeadsRepository;
+  readonly phones: PhoneValidationService;
 
   constructor(
-    db: Database,
+    private readonly db: Database,
     private readonly audit: AuditService,
     private readonly timeline: TimelineService,
     private readonly hooks: AutomationEmitter,
@@ -622,6 +756,28 @@ export class LeadsService {
     private readonly followUps: FollowUpScheduler | null = null,
   ) {
     this.repo = new LeadsRepository(db);
+    this.phones = new PhoneValidationService(db);
+  }
+
+  /** Drop contact details for duplicate leads outside the caller's visibility. */
+  async attachVisibleDuplicates(leads: Lead[], claims: Claims): Promise<Lead[]> {
+    const allIds = [...new Set(leads.flatMap((l) => l.phoneDuplicateLeadIds))];
+    if (allIds.length === 0) {
+      return leads.map((l) => ({ ...l, phoneDuplicateLeads: [], phoneDuplicateLeadIds: [] }));
+    }
+    const scope = duplicateScopeFor(claims).leads;
+    const visible = await internal("failed to load duplicate leads", () =>
+      this.repo.visibleLeadSummaries(allIds, scope),
+    );
+    const map = new Map(visible.map((v) => [v.id, v]));
+    return leads.map((l) => {
+      const ids = l.phoneDuplicateLeadIds.filter((id) => map.has(id));
+      return {
+        ...l,
+        phoneDuplicateLeadIds: ids,
+        phoneDuplicateLeads: ids.map((id) => map.get(id)!),
+      };
+    });
   }
 
   /**
@@ -719,10 +875,12 @@ export class LeadsService {
     if (isSe || !input.ownerUserId) input.ownerUserId = claims.userId;
     if (claims.teamIds.length > 0 && (!input.teamId || isSe)) input.teamId = claims.teamIds[0];
 
-    const name = input.fullName.trim();
-    const dups = await internal("failed to check duplicates", () =>
-      this.repo.findDuplicates("", normalizeEmail(input.email), normalizePhone(input.phone), name, duplicateScopeFor(claims)),
-    );
+    // Soft-block only on email. Phone is async; same-name leads are common and must not block create.
+    const dups = (
+      await internal("failed to check duplicates", () =>
+        this.repo.findDuplicates("", normalizeEmail(input.email), null, null, duplicateScopeFor(claims)),
+      )
+    ).filter((d) => d.reason === "email");
     if (dups.length > 0 && !input.forceCreate) return { duplicates: dups, needsReview: true };
 
     const nextAt = nextActivity(input.nextActivityAt);
@@ -733,7 +891,12 @@ export class LeadsService {
       input.stageId = placement.stage.id;
     }
     const lead = await internal("failed to create lead", async () => {
-      const l = await this.repo.create(input, nextAt, { probability: placement?.stage.probability ?? null, closeDate });
+      const l = await this.repo.create(
+        input,
+        nextAt,
+        { probability: placement?.stage.probability ?? null, closeDate },
+        actorId,
+      );
       if (!l) throw new Error("created lead not found");
       return l;
     });
@@ -772,7 +935,17 @@ export class LeadsService {
       metadata: { source: lead.source },
     });
     if (nextAt) await this.scheduleLeadFollowUp(actorId, lead, nextAt, meta);
-    return { lead };
+
+    const phoneMarked = await this.phones.markPending(
+      lead.id,
+      lead.phone,
+      input.phoneCountryCode ?? lead.phoneCountryCode,
+      lead.country,
+    );
+    if (phoneMarked.enqueue) enqueuePhoneValidation(this.phones, lead.id, phoneMarked.version);
+
+    const [enriched] = await this.attachVisibleDuplicates([await this.get(lead.id)], claims);
+    return { lead: enriched ?? lead };
   }
 
   async update(claims: Claims, id: string, in_: UpdateLeadInput, meta: RequestMeta): Promise<LeadWriteResult> {
@@ -782,6 +955,51 @@ export class LeadsService {
     const phone = in_.phone !== undefined ? normalizePhone(in_.phone) : cur.phone;
     const name = in_.fullName !== undefined ? in_.fullName.trim() : cur.fullName;
     if (in_.priority !== undefined && !VALID_PRIORITIES.has(in_.priority)) throw AppError.validation("invalid priority");
+    if (in_.negotiationTag !== undefined) {
+      const tag = in_.negotiationTag.trim();
+      if (tag !== "" && !NEGOTIATION_TAG_SET.has(tag)) throw AppError.validation("invalid negotiation tag");
+      in_.negotiationTag = tag;
+      if (tag !== "Others") {
+        in_.negotiationRemarks = "";
+      } else {
+        const remarks = (in_.negotiationRemarks !== undefined ? in_.negotiationRemarks : cur.negotiationRemarks).trim();
+        if (remarks === "") throw AppError.validation("remarks are required when the tag is Others");
+        in_.negotiationRemarks = remarks;
+      }
+    } else if (in_.negotiationRemarks !== undefined && cur.negotiationTag === "Others") {
+      if (in_.negotiationRemarks.trim() === "") throw AppError.validation("remarks are required when the tag is Others");
+    }
+    const touchingContact =
+      in_.contactRating !== undefined || in_.contactRemarks !== undefined;
+    if (touchingContact) {
+      if (!isContactedStage(cur.stageName)) {
+        throw AppError.validation("Contact rating can only be edited while the lead is in Contacted", {
+          reason: "contact_rating_locked",
+        });
+      }
+      const nextRating =
+        in_.contactRating !== undefined ? parseContactRating(in_.contactRating) : parseContactRating(cur.contactRating);
+      const nextRemarks =
+        in_.contactRemarks !== undefined ? in_.contactRemarks.trim() : (cur.contactRemarks ?? "").trim();
+      if (in_.contactRating !== undefined && nextRating == null) {
+        throw AppError.validation("Star rating must be a whole number from 1 to 5");
+      }
+      // Saving either field requires a complete, valid pair so the lead can leave Contacted.
+      if (nextRating == null) throw AppError.validation("Add a star rating");
+      const remarksIssue = contactRemarksProblem(nextRemarks);
+      if (remarksIssue) throw AppError.validation(remarksIssue);
+      in_.contactRating = nextRating;
+      in_.contactRemarks = nextRemarks;
+      in_.contactRatedBy = actorId;
+    }
+    if (in_.nextFollowUpRemarks !== undefined) {
+      const next = in_.nextFollowUpRemarks.trim();
+      const issue = nextFollowUpRemarksProblem(next);
+      // Allow clearing only when the lead is not on a Contacted→Lost stage.
+      if (issue && requiresNextFollowUpRemarks(cur.stageName)) throw AppError.validation(issue);
+      if (next.length > 2000) throw AppError.validation("Keep next follow-up remarks under 2,000 characters");
+      in_.nextFollowUpRemarks = next;
+    }
     const curOwner = cur.ownerUserId ?? "";
     const curTeam = cur.teamId ?? "";
     const newOwner = in_.ownerUserId !== undefined ? in_.ownerUserId.trim() : curOwner;
@@ -790,10 +1008,16 @@ export class LeadsService {
       assignTargetInScope(claims, newOwner !== curOwner ? newOwner : "", newTeam !== curTeam ? newTeam : "");
     }
 
-    const dups = await internal("failed to check duplicates", () =>
-      this.repo.findDuplicates(id, email, phone, name, duplicateScopeFor(claims)),
-    );
-    if (dups.length > 0 && !in_.forceUpdate) return { duplicates: dups, needsReview: true };
+    // Soft-block only when email is changing and already belongs to another record.
+    // Unrelated edits (notes, stage fields, same name as someone else) must not 409.
+    if (in_.email !== undefined && !in_.forceUpdate) {
+      const dups = (
+        await internal("failed to check duplicates", () =>
+          this.repo.findDuplicates(id, email, null, null, duplicateScopeFor(claims)),
+        )
+      ).filter((d) => d.reason === "email");
+      if (dups.length > 0) return { duplicates: dups, needsReview: true };
+    }
 
     const status = in_.status?.trim() ?? "";
     if (status !== "" && status !== cur.status) {
@@ -851,6 +1075,10 @@ export class LeadsService {
               isArchived: cur.isArchived,
               stageEnteredAt: cur.stageEnteredAt,
               createdAt: cur.createdAt,
+              contactRating: in_.contactRating !== undefined ? in_.contactRating : cur.contactRating,
+              contactRemarks: in_.contactRemarks !== undefined ? in_.contactRemarks.trim() : cur.contactRemarks,
+              nextFollowUpRemarks:
+                in_.nextFollowUpRemarks !== undefined ? in_.nextFollowUpRemarks.trim() : cur.nextFollowUpRemarks,
             },
           )
         : null;
@@ -896,7 +1124,26 @@ export class LeadsService {
         await this.clearLeadFollowUps(id);
       }
     }
-    return { lead };
+
+    const phoneChanged =
+      in_.phone !== undefined && (normalizePhone(in_.phone) ?? null) !== (cur.phone ?? null);
+    const countryChanged = in_.country !== undefined && in_.country !== cur.country;
+    const phoneCountryChanged =
+      in_.phoneCountryCode !== undefined &&
+      in_.phoneCountryCode.trim().toUpperCase() !== (cur.phoneCountryCode || "").toUpperCase();
+    if (phoneChanged || countryChanged || phoneCountryChanged) {
+      const marked = await this.phones.markPending(
+        id,
+        lead.phone,
+        in_.phoneCountryCode ?? lead.phoneCountryCode,
+        lead.country,
+      );
+      if (marked.enqueue) enqueuePhoneValidation(this.phones, id, marked.version);
+      lead = await this.get(id);
+    }
+
+    const [enriched] = await this.attachVisibleDuplicates([lead], claims);
+    return { lead: enriched ?? lead };
   }
 
   async archive(actorId: string, ids: string[] | undefined, archive: boolean, meta: RequestMeta): Promise<number> {
@@ -954,4 +1201,107 @@ export class LeadsService {
       this.repo.findDuplicates(excludeId, normalizeEmail(email), normalizePhone(phone), name ?? null, duplicateScopeFor(claims)),
     );
   }
+
+  /** True when the lead has an open document send-by date that is already past. */
+  async hasOverdueDocumentDeadline(leadId: string): Promise<boolean> {
+    const r = await internal("failed to check document deadline", () =>
+      sql<{ overdue: boolean }>`
+        SELECT EXISTS (
+          SELECT 1
+          FROM documents d
+          WHERE d.lead_id = ${leadId}::uuid
+            AND d.expires_at IS NOT NULL
+            AND d.expires_at < NOW()
+            AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
+        ) AS overdue`.execute(this.db),
+    );
+    return Boolean(r.rows[0]?.overdue);
+  }
+
+  async listDocumentDelayRemarks(leadId: string): Promise<DocumentDelayRemark[]> {
+    await this.get(leadId);
+    const r = await internal("failed to list document delay remarks", () =>
+      sql<DocumentDelayRemark>`
+        SELECT r.id::text AS "id", r.lead_id::text AS "leadId", r.body,
+          r.author_user_id::text AS "authorUserId", u.full_name AS "authorName",
+          r.created_at AS "createdAt"
+        FROM lead_document_delay_remarks r
+        LEFT JOIN users u ON u.id = r.author_user_id
+        WHERE r.lead_id = ${leadId}::uuid
+        ORDER BY r.created_at DESC`.execute(this.db),
+    );
+    return r.rows;
+  }
+
+  /**
+   * Appends an overdue-document remark and refreshes the latest copy on the lead.
+   * History rows are kept so TL/SA can see prior explanations.
+   */
+  async addDocumentDelayRemark(
+    claims: Claims,
+    leadId: string,
+    body: string,
+    meta: RequestMeta,
+  ): Promise<{ lead: Lead; remark: DocumentDelayRemark }> {
+    const text = body.trim();
+    if (text === "") throw AppError.validation("remarks are required");
+    if (text.length > 1000) throw AppError.validation("remarks must be at most 1000 characters");
+    const lead = await this.get(leadId);
+    if (!(await this.hasOverdueDocumentDeadline(leadId))) {
+      throw AppError.validation("Document deliverables are not overdue for this lead", {
+        reason: "document_not_overdue",
+      });
+    }
+    const now = new Date();
+    const id = randomUUID();
+    await internal("failed to save document delay remarks", async () => {
+      await sql`
+        INSERT INTO lead_document_delay_remarks (id, lead_id, body, author_user_id, created_at)
+        VALUES (${id}::uuid, ${leadId}::uuid, ${text}, ${claims.userId}::uuid, ${now})`.execute(this.db);
+      await sql`
+        UPDATE leads SET
+          document_delay_remarks = ${text},
+          document_delay_remarks_at = ${now},
+          document_delay_remarks_by = ${claims.userId}::uuid,
+          updated_at = ${now}
+        WHERE id = ${leadId}::uuid`.execute(this.db);
+    });
+    await this.audit.record(
+      claims.userId,
+      "lead.document_delay_remarks",
+      "lead",
+      leadId,
+      { body: text },
+      meta,
+    );
+    const history = await internal("failed to list document delay remarks", () =>
+      sql<DocumentDelayRemark>`
+        SELECT r.id::text AS "id", r.lead_id::text AS "leadId", r.body,
+          r.author_user_id::text AS "authorUserId", u.full_name AS "authorName",
+          r.created_at AS "createdAt"
+        FROM lead_document_delay_remarks r
+        LEFT JOIN users u ON u.id = r.author_user_id
+        WHERE r.id = ${id}::uuid`.execute(this.db),
+    );
+    return {
+      lead: await this.get(leadId),
+      remark: history.rows[0] ?? {
+        id,
+        leadId,
+        body: text,
+        authorUserId: claims.userId,
+        authorName: null,
+        createdAt: now,
+      },
+    };
+  }
+}
+
+export interface DocumentDelayRemark {
+  id: string;
+  leadId: string;
+  body: string;
+  authorUserId: string | null;
+  authorName: string | null;
+  createdAt: Date;
 }

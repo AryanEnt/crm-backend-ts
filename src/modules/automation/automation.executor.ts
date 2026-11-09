@@ -259,8 +259,9 @@ export class AutomationExecutor {
     const type = ActionType.SendEmail;
     const templateId = asString(p.templateId).trim();
     if (templateId === "") return failed(type, "templateId required");
-    const tpl = await sql<{ subject: string; body: string }>`
-      SELECT subject, body_html AS body FROM email_templates WHERE id=${templateId} AND is_active=TRUE`
+    const tpl = await sql<{ subject: string; body: string; signature: string }>`
+      SELECT subject, body_html AS body, signature_html AS signature
+      FROM email_templates WHERE id=${templateId} AND is_active=TRUE`
       .execute(this.db)
       .then((r) => r.rows[0], () => undefined);
     if (!tpl) return failed(type, "email template not found");
@@ -280,7 +281,14 @@ export class AutomationExecutor {
 
     const vars = await this.templateVars(ctx);
     const subject = applyTemplate(tpl.subject, vars);
-    const body = applyTemplate(tpl.body, vars);
+    const bodyOnly = applyTemplate(tpl.body, vars);
+    const signature = applyTemplate(tpl.signature ?? "", vars).trim();
+    const body =
+      signature === ""
+        ? bodyOnly
+        : bodyOnly.trim() === ""
+          ? `<div style="margin-top:0;padding-top:0;border-top:none;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;color:#374151;">${signature}</div>`
+          : `${bodyOnly}<div style="margin-top:20px;padding-top:14px;border-top:1px solid #e5e7eb;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;color:#374151;">${signature}</div>`;
     if (new RegExp(TEMPLATE_VAR.source).test(subject + body)) return failed(type, "template has unresolved variables");
 
     const links = resolveLinks(resourceType, resourceId, ctx);

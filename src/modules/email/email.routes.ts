@@ -1,6 +1,6 @@
 import type { Request, Response, Router } from "express";
 import { z } from "zod";
-import { atoi, queryParam } from "../../lib/query.js";
+import { atoi, parseBool, queryParam } from "../../lib/query.js";
 import { readBody } from "../../lib/raw-body.js";
 import { pathParam, requestMetaFirstHopWithPort } from "../../lib/request-meta.js";
 import { AppError } from "../../lib/app-error.js";
@@ -19,6 +19,12 @@ const PUBSUB_BODY_LIMIT = 1 << 20;
 const associateSchema = z.strictObject({ leadId: optionalString(), customerId: optionalString(), dealId: optionalString() });
 const patchThreadSchema = z.strictObject({ starred: optionalBool(), archived: optionalBool() });
 
+const composeAttachmentSchema = z.strictObject({
+  filename: str(),
+  mimeType: str(),
+  contentBase64: str(),
+});
+
 const composeSchema = z.strictObject({
   accountId: str(),
   to: stringArray(),
@@ -34,6 +40,10 @@ const composeSchema = z.strictObject({
   threadId: optionalString(),
   scheduledAt: optionalString(),
   send: bool(),
+  attachments: z
+    .array(composeAttachmentSchema)
+    .nullish()
+    .transform((v) => v ?? undefined),
 });
 
 const draftSchema = z.strictObject({
@@ -57,6 +67,7 @@ const templateSchema = z.strictObject({
   name: str(),
   subject: str(),
   bodyHtml: str(),
+  signatureHtml: optionalString(),
   category: str(),
   variables: stringArray(),
   isActive: optionalBool(),
@@ -318,7 +329,7 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
   });
 
   router.get("/api/v1/email/templates", ...guard(P.EmailView, P.EmailManage), async (req, res) => {
-    ok(res, await service.listTemplates(claimsOf(req)));
+    ok(res, await service.listTemplates(claimsOf(req), parseBool(queryParam(req, "includeInactive"))));
   });
 
   router.post("/api/v1/email/templates", ...guard(P.EmailManage), jsonBody, async (req, res) => {
@@ -328,11 +339,11 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
 
   router.patch("/api/v1/email/templates/:id", ...guard(P.EmailManage), jsonBody, async (req, res) => {
     const in_ = decodeJson(req, templateSchema);
-    ok(res, await service.updateTemplate(pathParam(req, "id"), in_));
+    ok(res, await service.updateTemplate(claimsOf(req), pathParam(req, "id"), in_));
   });
 
   router.delete("/api/v1/email/templates/:id", ...guard(P.EmailManage), async (req, res) => {
-    await service.deleteTemplate(pathParam(req, "id"));
+    await service.deleteTemplate(claimsOf(req), pathParam(req, "id"));
     ok(res, { deleted: true });
   });
 

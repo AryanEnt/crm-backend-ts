@@ -68,8 +68,8 @@ export interface PromptOutcome {
 }
 
 /**
- * Stage an answer moves the lead to, or null to leave it. Contacted and Qualified match stages by
- * name, falling back to the second and third open stage; leads only ever move forward.
+ * Stage an answer moves the lead to, or null to leave it. Contacted matches by name; Qualified
+ * also accepts Negotiation (post–stage-rename). Falls back to the 2nd / 3rd open stage; only forward.
  */
 export function promptTarget(stages: Stage[], currentStageId: string | null, result: PromptResult): Stage | null {
   const active = stages.filter((s) => s.isActive).sort((a, b) => a.position - b.position);
@@ -78,7 +78,10 @@ export function promptTarget(stages: Stage[], currentStageId: string | null, res
   if (result === PromptResult.NoAnswer) return null;
   if (result === PromptResult.NotQualified) return active.find((s) => s.isLost) ?? null;
   const open = active.filter((s) => !s.isWon && !s.isLost);
-  const target = open.find((s) => s.name.trim().toLowerCase() === result) ?? open[result === PromptResult.Contacted ? 1 : 2];
+  const nameOf = (s: Stage) => s.name.trim().toLowerCase();
+  const aliases =
+    result === PromptResult.Qualified ? ["qualified", "negotiation"] : result === PromptResult.Contacted ? ["contacted"] : [result];
+  const target = open.find((s) => aliases.includes(nameOf(s))) ?? open[result === PromptResult.Contacted ? 1 : 2];
   if (!target) return null;
   if (current && target.position <= current.position) return null;
   return target;
@@ -197,6 +200,7 @@ export class ActivityPromptsService {
     }
     try {
       await this.leadStages.move(
+
         actor,
         leadId,
         { stageId: target.id, lostReason: result === PromptResult.NotQualified ? note || "Not qualified" : undefined },

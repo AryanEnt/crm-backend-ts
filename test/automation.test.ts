@@ -250,7 +250,7 @@ describe("automation executor on leads", () => {
 
   it("move validation failures fail the action instead of the job", async () => {
     const { executor } = setup(async () => {
-      throw AppError.validation("Lead is closed as Won; reopen it to move");
+      throw AppError.validation("Lead is closed as Purchased; reopen it to move");
     });
     const { results, error } = await executor.execute(
       { ...rule, actions: [{ type: "change_stage", params: { stageId: "s1" } }] },
@@ -258,8 +258,8 @@ describe("automation executor on leads", () => {
       "lead",
       "l1",
     );
-    expect(results[0]).toEqual({ type: "change_stage", status: "failed", error: "Lead is closed as Won; reopen it to move" });
-    expect(error).toBe("change_stage: Lead is closed as Won; reopen it to move");
+    expect(results[0]).toEqual({ type: "change_stage", status: "failed", error: "Lead is closed as Purchased; reopen it to move" });
+    expect(error).toBe("change_stage: Lead is closed as Purchased; reopen it to move");
   });
 
   it("update_field cannot close a lead", async () => {

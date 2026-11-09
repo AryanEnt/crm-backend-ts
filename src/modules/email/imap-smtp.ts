@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import { simpleParser } from "mailparser";
-import { parseAddress, parseAddressList } from "./mime.js";
+import { buildRfc822, parseAddress, parseAddressList } from "./mime.js";
 import {
   MailProviderError,
   classifyMailError,
@@ -205,6 +205,14 @@ export class ImapSmtpTransport implements MailTransport {
         text: mail.text,
         html: mail.html,
         inReplyTo: mail.inReplyTo,
+        attachments: (mail.attachments ?? []).map((a) => ({
+          filename: a.filename,
+          content: a.content,
+          contentType: a.mimeType || "application/octet-stream",
+          ...(a.contentId
+            ? { cid: a.contentId, contentDisposition: "inline" as const }
+            : { contentDisposition: "attachment" as const }),
+        })),
         envelope: { from: mail.fromAddress, to: [...mail.to, ...mail.cc, ...mail.bcc] },
       });
       const providerMessageId = String(info.messageId || "").trim() || `smtp:${Date.now()}`;
@@ -220,13 +228,27 @@ export class ImapSmtpTransport implements MailTransport {
   }
 
   private async appendSent(auth: MailboxAuth, mail: SendMailInput, messageId: string, path: string): Promise<void> {
-    const from = mail.fromName ? `"${mail.fromName.replace(/"/g, "")}" <${mail.fromAddress}>` : mail.fromAddress;
-    let raw = `From: ${from}\r\nTo: ${mail.to.join(", ")}\r\n`;
-    if (mail.cc.length) raw += `Cc: ${mail.cc.join(", ")}\r\n`;
-    raw += `Subject: ${mail.subject}\r\nMessage-ID: ${messageId}\r\nMIME-Version: 1.0\r\n`;
-    raw += mail.html
-      ? `Content-Type: text/html; charset=UTF-8\r\n\r\n${mail.html}`
-      : `Content-Type: text/plain; charset=UTF-8\r\n\r\n${mail.text}`;
+    // Rebuild with the same multipart/related CID structure nodemailer used for SMTP.
+    let raw = buildRfc822(
+      mail.fromName,
+      mail.fromAddress,
+      {
+        toAddresses: mail.to,
+        ccAddresses: mail.cc,
+        bccAddresses: mail.bcc,
+        subject: mail.subject,
+        bodyHtml: mail.html,
+        bodyText: mail.text,
+      },
+      (mail.attachments ?? []).map((a) => ({
+        filename: a.filename,
+        mimeType: a.mimeType,
+        content: a.content,
+        contentId: a.contentId,
+      })),
+    );
+    // Message-ID after headers start; insert before MIME-Version if present.
+    raw = raw.replace(/\r\nMIME-Version:/, `\r\nMessage-ID: ${messageId}\r\nMIME-Version:`);
     const client = imapClient(this.settings, auth);
     try {
       await client.connect();

@@ -36,6 +36,11 @@ import { ImapSmtpTransport, type ImapSmtpSettings } from "./imap-smtp.js";
 import { assertMailHostAllowed, parseHostAllowlist } from "./mail-host-guard.js";
 import { assignedUserIds, canChangeMailboxSettings, canInviteUser, canManageMailbox, canSendFromMailbox } from "./mailbox-access.js";
 import {
+  assertCanAccessTemplateTeam,
+  canSeeAllTemplates,
+  resolveTemplateTeamId,
+} from "./template-access.js";
+import {
   classifyMailError,
   safeMailError,
   type FetchedMail,
@@ -44,7 +49,17 @@ import {
   type MailTransport,
   type MailboxAuth,
 } from "./mail-provider.js";
-import { applyVars, buildRfc822, findUnresolved, parseAddress, parseAddressList, parseInt64, stripTags, uniqueEmails } from "./mime.js";
+import {
+  applyVars,
+  buildRfc822,
+  findUnresolved,
+  parseAddress,
+  parseAddressList,
+  parseInt64,
+  prepareOutboundPayload,
+  stripTags,
+  uniqueEmails,
+} from "./mime.js";
 import { sanitizeEmailHtml } from "./sanitize.js";
 
 export interface EmailConfig {
@@ -91,6 +106,12 @@ export interface PreviewResult {
 /** Go *string fields: undefined when absent or null. */
 type Ref = string | undefined;
 
+export type ComposeAttachmentInput = {
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+};
+
 export interface ComposeInput {
   accountId: string;
   to: string[] | undefined;
@@ -106,6 +127,39 @@ export interface ComposeInput {
   threadId: Ref;
   scheduledAt: Ref;
   send: boolean;
+  /** Outbound files (PDF/images/etc.); included when the message is sent. */
+  attachments?: ComposeAttachmentInput[] | undefined;
+}
+
+const MAX_OUTBOUND_ATTACHMENTS = 10;
+const MAX_OUTBOUND_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+function parseComposeAttachments(
+  raw: ComposeAttachmentInput[] | undefined,
+): { filename: string; mimeType: string; content: Buffer }[] {
+  const list = raw ?? [];
+  if (list.length > MAX_OUTBOUND_ATTACHMENTS) {
+    throw AppError.validation(`You can attach up to ${MAX_OUTBOUND_ATTACHMENTS} files`);
+  }
+  const out: { filename: string; mimeType: string; content: Buffer }[] = [];
+  for (const a of list) {
+    const filename = (a.filename ?? "").trim() || "attachment";
+    const mimeType = (a.mimeType ?? "").trim() || "application/octet-stream";
+    const b64 = (a.contentBase64 ?? "").replace(/\s+/g, "");
+    if (b64 === "") throw AppError.validation(`Attachment “${filename}” is empty`);
+    let content: Buffer;
+    try {
+      content = Buffer.from(b64, "base64");
+    } catch {
+      throw AppError.validation(`Attachment “${filename}” is invalid`);
+    }
+    if (content.length === 0) throw AppError.validation(`Attachment “${filename}” is empty`);
+    if (content.length > MAX_OUTBOUND_ATTACHMENT_BYTES) {
+      throw AppError.validation(`“${filename}” is over 15 MB`);
+    }
+    out.push({ filename, mimeType, content });
+  }
+  return out;
 }
 
 export interface DraftPatch {
@@ -127,6 +181,7 @@ export interface TemplateInput {
   name: string;
   subject: string;
   bodyHtml: string;
+  signatureHtml: string | undefined;
   category: string;
   variables: string[] | undefined;
   isActive: boolean | undefined;
@@ -370,7 +425,17 @@ export class EmailService {
 
   private mailboxAuth(acc: AccountRecord): MailboxAuth {
     const user = (acc.username || "").trim() || acc.emailAddress;
-    return { user, pass: this.box.decrypt(acc.encryptedPassword) };
+    try {
+      return { user, pass: this.box.decrypt(acc.encryptedPassword) };
+    } catch (err) {
+      logger.warn(
+        { account: acc.id, error: err instanceof Error ? err.message : String(err) },
+        "mailbox password decrypt failed — check TOKEN_ENCRYPTION_KEY matches the key used when connecting",
+      );
+      throw AppError.validation(
+        "Could not unlock the mailbox password. Ask your Team Lead to reconnect it in Team Email (server encryption key may have changed).",
+      );
+    }
   }
 
   private companyServer(): ImapSmtpSettings | null {
@@ -389,8 +454,19 @@ export class EmailService {
     };
   }
 
+  /**
+   * Server settings for this mailbox only.
+   * Never fall back to the company MAIL_* hosts unless that server actually serves
+   * this mailbox's domain — otherwise @other.com mail is sent via entegrasources SMTP and rejected.
+   */
   private settingsForAccount(acc: AccountRecord): ImapSmtpSettings {
-    return resolveImapSettings(
+    const domain = domainOfEmail(acc.emailAddress);
+    const company = this.envImapSettings();
+    const companyServesMailbox =
+      Boolean(company.imapHost.trim() && company.smtpHost.trim()) &&
+      hostServesDomain(company.imapHost, domain) &&
+      hostServesDomain(company.smtpHost, domain);
+    const settings = resolveImapSettings(
       acc.provider,
       {
         imapHost: acc.imapHost,
@@ -400,14 +476,18 @@ export class EmailService {
         smtpPort: acc.smtpPort,
         smtpSecure: acc.smtpSecure,
       },
-      this.envImapSettings(),
+      companyServesMailbox ? company : undefined,
     );
+    if (!settings.smtpHost.trim()) {
+      throw AppError.validation(
+        `No SMTP server is configured for ${acc.emailAddress}. Reconnect the mailbox in Team Email (pick Migadu, Spacemail, or the correct custom host for @${domain}).`,
+      );
+    }
+    return settings;
   }
 
   private transportFor(acc: AccountRecord): MailTransport {
-    const settings = this.settingsForAccount(acc);
-    if (!settings.imapHost && !settings.smtpHost) return this.imap;
-    return this.createImap(settings);
+    return this.createImap(this.settingsForAccount(acc));
   }
 
   private hostPolicy() {
@@ -526,7 +606,7 @@ export class EmailService {
   }
 
   private async syncAccount(acc: AccountRecord): Promise<void> {
-    if (acc.provider === "imap") {
+    if (isImapProvider(acc.provider)) {
       await this.syncImapAccount(acc);
       return;
     }
@@ -742,6 +822,7 @@ export class EmailService {
     if (in_.send && !preview.canSend) throw AppError.validation("Email still contains unresolved variables");
     const to = uniqueEmails(in_.to);
     if (in_.send && to.length === 0) throw AppError.validation("Add at least one recipient");
+    const attachments = parseComposeAttachments(in_.attachments);
     const thread = await this.threadForCompose(acc, in_, to);
     const scheduled = in_.scheduledAt !== undefined && in_.scheduledAt.trim() !== "";
     const status = scheduled ? "scheduled" : in_.send ? "sending" : "draft";
@@ -772,11 +853,32 @@ export class EmailService {
       receivedAt: null,
       scheduledAt,
       status,
-      hasAttachments: false,
+      hasAttachments: attachments.length > 0,
       inReplyTo: ref(in_.inReplyTo),
     });
+    if (saved && attachments.length > 0) {
+      for (const a of attachments) {
+        await this.repo.insertAttachment({
+          messageId: saved.id,
+          filename: a.filename,
+          mimeType: a.mimeType,
+          sizeBytes: a.content.length,
+          providerAttachmentId: "",
+        });
+      }
+      saved.attachments = attachments.map((a, i) => ({
+        id: `pending-${i}`,
+        messageId: saved.id,
+        filename: a.filename,
+        mimeType: a.mimeType,
+        sizeBytes: a.content.length,
+        providerAttachmentId: "",
+      }));
+    }
     await this.repo.refreshThreadStats(thread!.id).catch(() => undefined);
-    if (status === "sending") return this.sendMessage(claims.userId, acc, thread!, saved!, meta);
+    if (status === "sending") {
+      return this.sendMessage(claims.userId, acc, thread!, saved!, meta, attachments);
+    }
     return saved;
   }
 
@@ -831,7 +933,7 @@ export class EmailService {
     if (m.ownerUserId !== claims.userId) throw AppError.forbidden("cannot send this message");
     const acc = await this.requireOwnAccount(claims, m.accountId);
     const thread = await this.repo.getThread(m.threadId);
-    if (!thread) throw new Error("thread not found for message");
+    if (!thread) throw AppError.notFound("thread not found");
     const preview = await this.preview(m.subject, m.bodyHtml, m.bodyText, thread.leadId, thread.customerId);
     if (!preview.canSend) throw AppError.validation("Email still contains unresolved variables");
     m.subject = preview.subject;
@@ -840,11 +942,19 @@ export class EmailService {
     return this.sendMessage(claims.userId, acc, thread, m, meta);
   }
 
-  private async sendMessage(actorId: string, acc: AccountRecord, thread: Thread, m: Message, meta: RequestMeta): Promise<Message | null> {
+  private async sendMessage(
+    actorId: string,
+    acc: AccountRecord,
+    thread: Thread,
+    m: Message,
+    meta: RequestMeta,
+    outboundAttachments: { filename: string; mimeType: string; content: Buffer }[] = [],
+  ): Promise<Message | null> {
     if (m.toAddresses.length === 0) throw AppError.validation("Add at least one recipient");
     m.fromAddress = acc.emailAddress;
     m.fromName = acc.displayName;
-    if (acc.provider === "imap") return this.sendImap(actorId, acc, thread, m, meta);
+    // migadu / spacemail / custom imap all use SMTP — not Gmail OAuth
+    if (isImapProvider(acc.provider)) return this.sendImap(actorId, acc, thread, m, meta, outboundAttachments);
     let token: string;
     try {
       token = await this.accessToken(acc);
@@ -854,7 +964,7 @@ export class EmailService {
       await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: "reauth" }, meta);
       throw err;
     }
-    const raw = buildRfc822(acc.displayName, acc.emailAddress, m);
+    const raw = buildRfc822(acc.displayName, acc.emailAddress, m, outboundAttachments);
     const threadId = thread.providerThreadId.startsWith("local-") ? "" : thread.providerThreadId;
     let sent;
     try {
@@ -902,38 +1012,50 @@ export class EmailService {
     return { ...out, unresolved, canSend: unresolved === null };
   }
 
-  listTemplates(claims: Claims): Promise<Template[]> {
-    return this.repo.listTemplates(claims.teamIds);
+  listTemplates(claims: Claims, includeInactive = false): Promise<Template[]> {
+    const showInactive = includeInactive && expandImplies(claims.permissions).has(P.EmailManage);
+    const activeOnly = !showInactive;
+    if (canSeeAllTemplates(claims)) return this.repo.listTemplates(null, activeOnly);
+    return this.repo.listTemplates(claims.teamIds, activeOnly);
   }
 
   async createTemplate(claims: Claims, in_: TemplateInput): Promise<Template | null> {
     if (in_.name.trim() === "") throw AppError.validation("Template name is required");
+    const teamId = resolveTemplateTeamId(claims, in_.teamId);
     return this.repo.insertTemplate({
       name: in_.name.trim(),
       subject: in_.subject,
       bodyHtml: in_.bodyHtml,
+      signatureHtml: in_.signatureHtml ?? "",
       category: in_.category !== "" ? in_.category : "general",
       variables: in_.variables ?? [],
       isActive: in_.isActive ?? true,
       createdBy: claims.userId,
-      teamId: ref(in_.teamId),
+      teamId,
     });
   }
 
-  async updateTemplate(id: string, in_: TemplateInput): Promise<Template | null> {
+  async updateTemplate(claims: Claims, id: string, in_: TemplateInput): Promise<Template | null> {
     const t = await this.repo.getTemplate(id);
     if (!t) throw AppError.notFound("template not found");
+    assertCanAccessTemplateTeam(claims, t.teamId);
     if (in_.name.trim() !== "") t.name = in_.name.trim();
     if (in_.subject !== "") t.subject = in_.subject;
     if (in_.bodyHtml !== "") t.bodyHtml = in_.bodyHtml;
+    if (in_.signatureHtml !== undefined) t.signatureHtml = in_.signatureHtml;
     if (in_.category !== "") t.category = in_.category;
     if (in_.variables !== undefined) t.variables = in_.variables;
     if (in_.isActive !== undefined) t.isActive = in_.isActive;
-    if (in_.teamId !== undefined) t.teamId = in_.teamId;
+    if (canSeeAllTemplates(claims) && in_.teamId !== undefined && in_.teamId !== "") {
+      t.teamId = in_.teamId;
+    }
     return this.repo.updateTemplate(t);
   }
 
-  deleteTemplate(id: string): Promise<void> {
+  async deleteTemplate(claims: Claims, id: string): Promise<void> {
+    const t = await this.repo.getTemplate(id);
+    if (!t) throw AppError.notFound("template not found");
+    assertCanAccessTemplateTeam(claims, t.teamId);
     return this.repo.deleteTemplate(id);
   }
 
@@ -1374,24 +1496,42 @@ export class EmailService {
     thread: Thread,
     m: Message,
     meta: RequestMeta,
+    outboundAttachments: { filename: string; mimeType: string; content: Buffer }[] = [],
   ): Promise<Message | null> {
+    const settings = this.settingsForAccount(acc);
     let sent;
     try {
-      sent = await this.transportFor(acc).send(this.mailboxAuth(acc), {
+      logger.info(
+        { account: acc.id, from: acc.emailAddress, smtpHost: settings.smtpHost, provider: acc.provider },
+        "sending via mailbox SMTP",
+      );
+      // data: URI images are blocked by Gmail/Outlook — rewrite to cid: inline parts.
+      const prepared = prepareOutboundPayload(m.bodyHtml, outboundAttachments);
+      sent = await this.createImap(settings).send(this.mailboxAuth(acc), {
         fromName: acc.displayName,
         fromAddress: acc.emailAddress,
         to: m.toAddresses,
         cc: m.ccAddresses,
         bcc: m.bccAddresses,
         subject: m.subject,
-        html: m.bodyHtml,
+        html: prepared.html,
         text: m.bodyText || stripTags(m.bodyHtml),
         inReplyTo: m.inReplyTo ?? undefined,
         sentFolder: acc.imapSentFolder || undefined,
+        attachments: prepared.attachments,
       });
     } catch (err) {
       const safe = classifyMailError(err);
-      logger.warn({ code: safe.code, stage: safe.stage, account: acc.id, cause: safe.diagnostics }, "imap send failed");
+      logger.warn(
+        {
+          code: safe.code,
+          stage: safe.stage,
+          account: acc.id,
+          smtpHost: settings.smtpHost,
+          cause: safe.diagnostics,
+        },
+        "imap send failed",
+      );
       m.status = "failed";
       await this.repo.updateMessage(m).catch(() => undefined);
       await this.audit.record(actorId, "email.send_failed", "email_message", m.id, { reason: safe.code }, meta);

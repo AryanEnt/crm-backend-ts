@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { sql } from "kysely";
 import type { Database } from "../../db/database.js";
 import { AppError } from "../../lib/app-error.js";
+import { goMapOrNull } from "../../lib/go-json.js";
 import { internal, type RequestMeta } from "../../lib/request-meta.js";
 import type { FollowUpRequest, NextActivityInput } from "../activities/activities.service.js";
 import type { Claims } from "../auth/types.js";
@@ -10,7 +11,10 @@ import { and, appendScope, effectiveScope, type Predicate, type Visibility } fro
 import { Records } from "../datascope/record.js";
 import { P } from "../permissions/permissions.js";
 import type { Pipeline, PipelinesRepository, Stage } from "../pipelines/pipelines.service.js";
+import { AttentionSql, validAttention } from "../attention/attention.js";
 import { TimelineEvent, TimelineService } from "../timeline/timeline.service.js";
+import { contactRemarksProblem, isContactedStage, parseContactRating } from "./contact-rating.js";
+import { nextFollowUpRemarksProblem, requiresNextFollowUpRemarks } from "./next-follow-up-remarks.js";
 
 /** The lead fields stage requirements and move rules look at. */
 export interface MovableLead {
@@ -33,6 +37,11 @@ export interface MovableLead {
   isArchived: boolean;
   stageEnteredAt: Date | null;
   createdAt: Date;
+  /** Contacted-stage star rating (1–5); null until set. */
+  contactRating: number | null;
+  contactRemarks: string;
+  /** Next follow-up plan; required on Contacted → Lost. */
+  nextFollowUpRemarks: string;
 }
 
 export interface MoveLeadInput {
@@ -47,6 +56,8 @@ export interface MoveLeadInput {
   documentDeadline?: string | undefined;
   /** Whole amount saved as the lead value when marking Sales Won. */
   closingAmount?: number | undefined;
+  /** Optional sale description appended to lead notes when marking Sales Won. */
+  purchaseNotes?: string | undefined;
   nextActivity?: NextActivityInput | undefined;
 }
 
@@ -57,6 +68,47 @@ export interface MoveOutcome {
   needsNextActivity: boolean;
   nextActivityId?: string;
 }
+
+/** One stage visit on a lead, oldest → newest. Built from lead_stage_transitions. */
+export interface LeadStagePeriod {
+  id: string;
+  leadId: string;
+  stageId: string;
+  stageName: string;
+  pipelineId: string;
+  enteredAt: Date;
+  exitedAt: Date | null;
+  /** Seconds in this stage. For the current stage this is computed from server now. */
+  durationSeconds: number;
+  movedToStageId: string | null;
+  movedToStageName: string | null;
+  /** Who moved the lead into this stage. */
+  enteredByUserId: string | null;
+  enteredByName: string | null;
+  /** Who moved the lead out of this stage; null while it is current. */
+  exitedByUserId: string | null;
+  exitedByName: string | null;
+  isCurrent: boolean;
+  kind: string | null;
+}
+
+type TransitionRow = {
+  id: string;
+  leadId: string;
+  fromPipelineId: string | null;
+  fromStageId: string | null;
+  fromStageName: string | null;
+  toPipelineId: string;
+  toStageId: string;
+  toStageName: string;
+  actorUserId: string | null;
+  actorName: string | null;
+  fromStageEnteredAt: Date | null;
+  enteredAt: Date;
+  durationSeconds: number | null;
+  metadata: unknown;
+  createdAt: Date;
+};
 
 export interface FollowUpScheduler {
   scheduleFollowUp(actorId: string, in_: FollowUpRequest, meta: RequestMeta): Promise<string>;
@@ -94,8 +146,16 @@ export interface BoardCard {
   wonAt: Date | null;
   lostAt: Date | null;
   lostReason: string;
+  negotiationTag: string;
+  negotiationRemarks: string;
+  contactRating: number | null;
+  contactRemarks: string;
+  nextFollowUpRemarks: string;
   /** Earliest open document send deadline for this lead (Nurturing chase). */
   documentDeadlineAt: Date | null;
+  /** Latest overdue document-delay remark (empty when none). */
+  documentDelayRemarks: string;
+  documentDelayRemarksAt: Date | null;
 }
 
 export interface BoardStage {
@@ -122,6 +182,12 @@ export interface LeadBoard {
   stages: BoardStage[];
 }
 
+/** How board columns order their cards (display only; does not change lead data). */
+export type BoardSortKey = "value" | "days" | "time" | "priority";
+export type BoardSortOrder = "asc" | "desc";
+
+export const BOARD_SORT_KEYS = ["value", "days", "time", "priority"] as const;
+
 export interface BoardFilter {
   pipelineId: string;
   search: string;
@@ -135,16 +201,50 @@ export interface BoardFilter {
   country: string;
   /** overdue | today | week | none | scheduled */
   activity: string;
+  /** over_sla | overdue_next | no_next_activity | … — empty is any */
+  attention?: string;
   minValue?: number | null;
   maxValue?: number | null;
   scope: Visibility;
   /** Cards per stage. */
   limit: number;
+  /** Column card order; defaults to days desc (newest into the stage first). */
+  sort?: BoardSortKey;
+  order?: BoardSortOrder;
 }
 
 export const BOARD_DEFAULT_LIMIT = 25;
 export const BOARD_MAX_LIMIT = 100;
 const VALID_ACTIVITY_FILTERS = new Set(["", "overdue", "today", "week", "none", "scheduled"]);
+
+export function parseBoardSort(raw: string): BoardSortKey {
+  return (BOARD_SORT_KEYS as readonly string[]).includes(raw) ? (raw as BoardSortKey) : "days";
+}
+
+export function parseBoardOrder(raw: string): BoardSortOrder {
+  return raw.toLowerCase() === "asc" ? "asc" : "desc";
+}
+
+/** ORDER BY fragment for board window / list queries. */
+export function boardOrderSql(sort: BoardSortKey, order: BoardSortOrder, opts: { wonColumn?: boolean } = {}) {
+  const dir = order === "asc" ? "ASC" : "DESC";
+  if (opts.wonColumn && sort === "days") {
+    return sql.raw(`l.won_at ${dir} NULLS LAST, l.id`);
+  }
+  switch (sort) {
+    case "value":
+      return sql.raw(`l.potential_value ${dir} NULLS LAST, l.id`);
+    case "time":
+      return sql.raw(`l.next_activity_at ${dir} NULLS LAST, l.id`);
+    case "priority":
+      return sql.raw(
+        `CASE lower(l.priority) WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END ${dir}, l.id`,
+      );
+    case "days":
+    default:
+      return sql.raw(`COALESCE(l.stage_entered_at, l.created_at) ${dir} NULLS LAST, l.id`);
+  }
+}
 
 /** Potential-value bounds shared by the lead list and the board; a bound excludes leads with no value. */
 export function leadValuePredicates(minValue?: number | null, maxValue?: number | null): Predicate[] {
@@ -269,6 +369,8 @@ interface MovePlan {
   /** Keep won_at when handing a Won lead into Nurturing (status becomes open again). */
   preserveWonAt?: boolean;
   closingAmount?: number | null;
+  /** Sale notes to append when marking Sales Won. */
+  purchaseNotes?: string | null;
 }
 
 export function parseClosingAmount(raw: number | undefined): number | null {
@@ -281,7 +383,9 @@ const MOVABLE_SELECT = sql`
     l.team_id::text AS "teamId", l.pipeline_id::text AS "pipelineId", l.stage_id::text AS "stageId", ps.name AS "stageName",
     l.source, l.priority, l.notes, l.employer, l.potential_value AS "potentialValue",
     CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
-    l.status, l.is_archived AS "isArchived", l.stage_entered_at AS "stageEnteredAt", l.created_at AS "createdAt"
+    l.status, l.is_archived AS "isArchived", l.stage_entered_at AS "stageEnteredAt", l.created_at AS "createdAt",
+    l.contact_rating AS "contactRating", COALESCE(l.contact_remarks, '') AS "contactRemarks",
+    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks"
   FROM leads l
   LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id`;
 
@@ -342,6 +446,90 @@ export class LeadStageService {
   }
 
   /**
+   * Chronological stage periods for the Lead History UI. Each transition starts a period in
+   * its to_stage; the next transition closes it. The open period's duration uses server time.
+   */
+  async listHistory(leadId: string): Promise<{ periods: LeadStagePeriod[]; serverNow: Date }> {
+    const lead = await this.loadMovable(leadId);
+    const r = await internal("failed to load lead stage history", () =>
+      sql<TransitionRow>`
+        SELECT t.id::text AS "id", t.lead_id::text AS "leadId",
+          t.from_pipeline_id::text AS "fromPipelineId", t.from_stage_id::text AS "fromStageId", fs.name AS "fromStageName",
+          t.to_pipeline_id::text AS "toPipelineId", t.to_stage_id::text AS "toStageId", ts.name AS "toStageName",
+          t.actor_user_id::text AS "actorUserId", u.full_name AS "actorName",
+          t.from_stage_entered_at AS "fromStageEnteredAt", t.entered_at AS "enteredAt",
+          t.duration_seconds AS "durationSeconds", t.metadata, t.created_at AS "createdAt"
+        FROM lead_stage_transitions t
+        LEFT JOIN pipeline_stages fs ON fs.id = t.from_stage_id
+        LEFT JOIN pipeline_stages ts ON ts.id = t.to_stage_id
+        LEFT JOIN users u ON u.id = t.actor_user_id
+        WHERE t.lead_id = ${leadId}
+        ORDER BY t.entered_at ASC, t.created_at ASC`.execute(this.db),
+    );
+    const now = new Date();
+    const rows = r.rows;
+    if (rows.length === 0) {
+      // No stored transitions: show the current stage from the lead row only (do not invent past moves).
+      if (!lead.stageId || !lead.pipelineId) return { periods: [], serverNow: now };
+      const enteredAt = lead.stageEnteredAt ?? lead.createdAt;
+      return {
+        periods: [
+          {
+            id: `current-${lead.id}`,
+            leadId: lead.id,
+            stageId: lead.stageId,
+            stageName: lead.stageName ?? "Current stage",
+            pipelineId: lead.pipelineId,
+            enteredAt,
+            exitedAt: null,
+            durationSeconds: Math.max(0, Math.trunc((now.getTime() - enteredAt.getTime()) / 1000)),
+            movedToStageId: null,
+            movedToStageName: null,
+            enteredByUserId: null,
+            enteredByName: null,
+            exitedByUserId: null,
+            exitedByName: null,
+            isCurrent: true,
+            kind: "current",
+          },
+        ],
+        serverNow: now,
+      };
+    }
+
+    const periods: LeadStagePeriod[] = rows.map((row, i) => {
+      const next = rows[i + 1];
+      const isCurrent = !next;
+      const enteredAt = row.enteredAt;
+      const exitedAt = next?.enteredAt ?? null;
+      const durationSeconds = isCurrent
+        ? Math.max(0, Math.trunc((now.getTime() - enteredAt.getTime()) / 1000))
+        : Math.max(0, next.durationSeconds ?? Math.trunc((exitedAt!.getTime() - enteredAt.getTime()) / 1000));
+      const meta = goMapOrNull(row.metadata) ?? {};
+      const kind = typeof meta.kind === "string" ? meta.kind : null;
+      return {
+        id: row.id,
+        leadId: row.leadId,
+        stageId: row.toStageId,
+        stageName: row.toStageName || "Stage",
+        pipelineId: row.toPipelineId,
+        enteredAt,
+        exitedAt,
+        durationSeconds,
+        movedToStageId: next?.toStageId ?? null,
+        movedToStageName: next?.toStageName ?? null,
+        enteredByUserId: row.actorUserId,
+        enteredByName: row.actorName,
+        exitedByUserId: next?.actorUserId ?? null,
+        exitedByName: next?.actorName ?? null,
+        isCurrent,
+        kind,
+      };
+    });
+    return { periods, serverNow: now };
+  }
+
+  /**
    * Validates a move without writing anything. `preview` lets PATCH check requirements against
    * the field values it is about to save in the same request.
    */
@@ -367,13 +555,55 @@ export class LeadStageService {
 
     const closed = CLOSED_STATUSES.has(lead.status);
     if (closed && !in_.reopen) {
-      throw AppError.validation(`Lead is closed as ${lead.status === "won" ? "Won" : "Lost"}; reopen it to move`, {
+      throw AppError.validation(`Lead is closed as ${lead.status === "won" ? "Purchased" : "Lost"}; reopen it to move`, {
         reason: "lead_closed",
         status: lead.status,
       });
     }
 
+    // Leaving Contacted requires a star rating and meaningful remarks (locked after the move).
+    if (isContactedStage(lead.stageName) && !isContactedStage(toStage.name)) {
+      const rating = parseContactRating(lead.contactRating);
+      const remarksIssue = contactRemarksProblem(lead.contactRemarks ?? "");
+      if (rating == null || remarksIssue) {
+        throw AppError.validation(
+          remarksIssue && rating == null
+            ? "Add a star rating and remarks before leaving Contacted"
+            : rating == null
+              ? "Add a star rating before leaving Contacted"
+              : remarksIssue!,
+          {
+            reason: "contact_rating_required",
+            missingFields: [
+              ...(rating == null ? ["contact_rating"] : []),
+              ...(remarksIssue ? ["contact_remarks"] : []),
+            ],
+            missingActivities: [],
+            missingDocuments: [],
+            stageId: lead.stageId,
+            stageName: lead.stageName,
+          },
+        );
+      }
+    }
+
     const force = in_.force === true;
+
+    // Contacted → Lost need a documented next follow-up plan (hard gate — force does not skip).
+    if (requiresNextFollowUpRemarks(toStage.name) || requiresNextFollowUpRemarks(lead.stageName)) {
+      const followUpIssue = nextFollowUpRemarksProblem(lead.nextFollowUpRemarks ?? "");
+      if (followUpIssue) {
+        throw AppError.validation(followUpIssue, {
+          reason: "next_follow_up_remarks_required",
+          missingFields: ["next_follow_up_remarks"],
+          missingActivities: [],
+          missingDocuments: [],
+          stageId: toStage.id,
+          stageName: toStage.name,
+        });
+      }
+    }
+
     if (!force) {
       const [customValues, missingActivities, missingDocuments] = await Promise.all([
         this.customFieldPresence(lead.id, toStage.requiredFields),
@@ -396,7 +626,7 @@ export class LeadStageService {
     const salesWon = toStage.isWon && toPipelineId !== NURTURING_PIPELINE_ID && lead.pipelineId !== NURTURING_PIPELINE_ID;
     if (salesWon) {
       if (!parseDocumentDeadline(in_.documentDeadline)) {
-        throw AppError.validation("Set a document send deadline before marking Won", {
+        throw AppError.validation("Set a document send deadline before marking Purchased", {
           reason: "document_deadline_required",
           missingActivities: [],
           missingDocuments: ["send_deadline"],
@@ -429,6 +659,7 @@ export class LeadStageService {
       forced: force,
       reopened: closed,
       closingAmount: salesWon ? parseClosingAmount(in_.closingAmount) : null,
+      purchaseNotes: salesWon ? (in_.purchaseNotes ?? "").trim() || null : null,
     };
   }
 
@@ -466,6 +697,14 @@ export class LeadStageService {
             potential_value = CASE
               WHEN ${plan.closingAmount != null}::bool THEN ${plan.closingAmount}
               ELSE potential_value
+            END,
+            notes = CASE
+              WHEN ${plan.purchaseNotes != null && plan.purchaseNotes !== ""}::bool THEN
+                CASE
+                  WHEN notes IS NULL OR btrim(notes) = '' THEN ${plan.purchaseNotes}
+                  ELSE notes || E'\n\n' || ${plan.purchaseNotes}
+                END
+              ELSE notes
             END,
             last_activity_at = ${now}
           WHERE id = ${lead.id}`.execute(tx);
@@ -666,7 +905,7 @@ export class LeadStageService {
         ) VALUES (
           ${randomUUID()}, 'Documents due', 'other', 'other', 'requested',
           ${new Date()}, ${deadline},
-          'Send-by date set when the lead was marked Won. Chase these in Nurturing.',
+          'Send-by date set when the lead was marked Purchased. Chase these in Nurturing.',
           ${leadId}
         )`.execute(this.db),
     );
@@ -676,6 +915,7 @@ export class LeadStageService {
 
   private boardWhere(f: Omit<BoardFilter, "limit">, opts: { pipelineScoped?: boolean } = {}): Predicate[] {
     if (!VALID_ACTIVITY_FILTERS.has(f.activity)) throw AppError.validation("invalid activity filter");
+    if (!validAttention(f.attention ?? "")) throw AppError.validation("invalid attention");
     const pipelineScoped = opts.pipelineScoped !== false;
     const where: Predicate[] = [sql`l.is_archived = FALSE`];
     if (pipelineScoped) where.push(sql`l.pipeline_id::text = ${f.pipelineId}`);
@@ -699,6 +939,8 @@ export class LeadStageService {
     }
     const activity = leadActivityPredicate(f.activity);
     if (activity) where.push(activity);
+    const attention = f.attention?.trim() ?? "";
+    if (attention !== "") where.push(sql`(${sql.raw(AttentionSql.lead)}) = ${attention}`);
     where.push(...leadValuePredicates(f.minValue, f.maxValue));
     return appendScope(where, f.scope, Records.Leads.columns);
   }
@@ -716,7 +958,18 @@ export class LeadStageService {
     return [...this.boardWhere(f, { pipelineScoped: false }), sql`l.won_at IS NOT NULL`];
   }
 
-  private async cards(where: Predicate[], perStage: number, offset: number): Promise<BoardCard[]> {
+  private boardSort(f: Pick<BoardFilter, "sort" | "order">): { sort: BoardSortKey; order: BoardSortOrder } {
+    return { sort: f.sort ?? "days", order: f.order ?? "desc" };
+  }
+
+  private async cards(
+    where: Predicate[],
+    perStage: number,
+    offset: number,
+    sort: BoardSortKey,
+    order: BoardSortOrder,
+  ): Promise<BoardCard[]> {
+    const orderBy = boardOrderSql(sort, order);
     const r = await sql<BoardCard & { rn: number }>`
       SELECT * FROM (
         SELECT l.id::text AS "id", l.full_name AS "fullName", l.employer, l.phone, l.email,
@@ -727,11 +980,19 @@ export class LeadStageService {
           CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
           COALESCE(l.stage_entered_at, l.created_at) AS "stageEnteredAt",
           l.won_at AS "wonAt", l.lost_at AS "lostAt", l.lost_reason AS "lostReason",
+          COALESCE(l.negotiation_tag, '') AS "negotiationTag",
+          COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
+          l.contact_rating AS "contactRating",
+          COALESCE(l.contact_remarks, '') AS "contactRemarks",
+          COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
           dd.deadline AS "documentDeadlineAt",
+          COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
+          l.document_delay_remarks_at AS "documentDelayRemarksAt",
           ROW_NUMBER() OVER (
-            PARTITION BY l.stage_id ORDER BY COALESCE(l.stage_entered_at, l.created_at) DESC, l.id
+            PARTITION BY l.stage_id ORDER BY ${orderBy}
           ) AS rn
         FROM leads l
+        LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
         LEFT JOIN users ou ON ou.id = l.owner_user_id
         LEFT JOIN LATERAL (
           SELECT COALESCE(NULLIF(a.title, ''), NULLIF(a.subject, ''), t.name, 'Follow up') AS title, t.code AS type_code
@@ -755,8 +1016,15 @@ export class LeadStageService {
     return r.rows.map(({ rn: _rn, ...card }) => card);
   }
 
-  /** Won column page: ordered by win date, not current stage (leads may live in Nurturing). */
-  private async wonAtCards(where: Predicate[], limit: number, offset: number): Promise<BoardCard[]> {
+  /** Won column page: ordered by the board sort (days → won_at); leads may live in Nurturing. */
+  private async wonAtCards(
+    where: Predicate[],
+    limit: number,
+    offset: number,
+    sort: BoardSortKey,
+    order: BoardSortOrder,
+  ): Promise<BoardCard[]> {
+    const orderBy = boardOrderSql(sort, order, { wonColumn: true });
     const r = await sql<BoardCard>`
       SELECT l.id::text AS "id", l.full_name AS "fullName", l.employer, l.phone, l.email,
         l.potential_value AS "potentialValue", l.currency, l.stage_id::text AS "stageId", l.status,
@@ -766,8 +1034,16 @@ export class LeadStageService {
         CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
         COALESCE(l.stage_entered_at, l.created_at) AS "stageEnteredAt",
         l.won_at AS "wonAt", l.lost_at AS "lostAt", l.lost_reason AS "lostReason",
-        dd.deadline AS "documentDeadlineAt"
+        COALESCE(l.negotiation_tag, '') AS "negotiationTag",
+        COALESCE(l.negotiation_remarks, '') AS "negotiationRemarks",
+        l.contact_rating AS "contactRating",
+        COALESCE(l.contact_remarks, '') AS "contactRemarks",
+        COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
+        dd.deadline AS "documentDeadlineAt",
+        COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
+        l.document_delay_remarks_at AS "documentDelayRemarksAt"
       FROM leads l
+      LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
       LEFT JOIN users ou ON ou.id = l.owner_user_id
       LEFT JOIN LATERAL (
         SELECT COALESCE(NULLIF(a.title, ''), NULLIF(a.subject, ''), t.name, 'Follow up') AS title, t.code AS type_code
@@ -785,7 +1061,7 @@ export class LeadStageService {
           AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
       ) dd ON TRUE
       WHERE ${and(where)}
-      ORDER BY l.won_at DESC NULLS LAST, l.id
+      ORDER BY ${orderBy}
       LIMIT ${limit} OFFSET ${offset}`.execute(this.db);
     return r.rows;
   }
@@ -796,6 +1072,7 @@ export class LeadStageService {
     if (pipeline.kind !== "leads") throw AppError.validation("pipeline is not a lead pipeline");
     const limit = clampLimit(f.limit);
     const where = this.boardWhere(f);
+    const { sort, order } = this.boardSort(f);
     const wonStage = this.salesWonStage(f.pipelineId, pipeline.stages);
     const wonWhere = wonStage ? this.wonAtWhere(f) : null;
 
@@ -803,18 +1080,22 @@ export class LeadStageService {
       internal("failed to load board", () =>
         sql<{ stageId: string | null; count: number; totalValue: number }>`
           SELECT l.stage_id::text AS "stageId", COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
-          FROM leads l WHERE ${and(where)} GROUP BY l.stage_id`.execute(this.db),
+          FROM leads l
+          LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+          WHERE ${and(where)} GROUP BY l.stage_id`.execute(this.db),
       ),
-      internal("failed to load board", () => this.cards(where, limit, 0)),
+      internal("failed to load board", () => this.cards(where, limit, 0, sort, order)),
       wonWhere
         ? internal("failed to load won totals", () =>
             sql<{ count: number; totalValue: number }>`
               SELECT COUNT(*)::int AS "count", COALESCE(SUM(l.potential_value), 0) AS "totalValue"
-              FROM leads l WHERE ${and(wonWhere)}`.execute(this.db),
+              FROM leads l
+              LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+              WHERE ${and(wonWhere)}`.execute(this.db),
           )
         : Promise.resolve(null),
       wonWhere
-        ? internal("failed to load won cards", () => this.wonAtCards(wonWhere, limit, 0))
+        ? internal("failed to load won cards", () => this.wonAtCards(wonWhere, limit, 0, sort, order))
         : Promise.resolve([] as BoardCard[]),
     ]);
     const totalsByStage = new Map(totals.rows.map((t) => [t.stageId ?? "", t]));
@@ -882,13 +1163,14 @@ export class LeadStageService {
   /** One more page of a single board column. */
   async boardStage(f: BoardFilter, stageId: string, offset: number): Promise<{ leads: BoardCard[]; hasMore: boolean }> {
     const limit = clampLimit(f.limit);
+    const { sort, order } = this.boardSort(f);
     const pipeline = await internal("failed to load pipeline", () => this.pipelines.get(f.pipelineId));
     if (!pipeline) throw AppError.notFound("pipeline not found");
     const wonStage = this.salesWonStage(f.pipelineId, pipeline.stages);
     if (wonStage && stageId === wonStage.id) {
       const where = this.wonAtWhere(f);
       const rows = await internal("failed to load board", () =>
-        this.wonAtCards(where, limit + 1, Math.max(0, offset)),
+        this.wonAtCards(where, limit + 1, Math.max(0, offset), sort, order),
       );
       const leads = rows.slice(0, limit).map((c) => ({
         ...c,
@@ -898,7 +1180,9 @@ export class LeadStageService {
       return { leads, hasMore: rows.length > limit };
     }
     const where = [...this.boardWhere(f), sql`l.stage_id::text = ${stageId}`];
-    const leads = await internal("failed to load board", () => this.cards(where, limit + 1, Math.max(0, offset)));
+    const leads = await internal("failed to load board", () =>
+      this.cards(where, limit + 1, Math.max(0, offset), sort, order),
+    );
     return { leads: leads.slice(0, limit), hasMore: leads.length > limit };
   }
 }
