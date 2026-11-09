@@ -116,6 +116,15 @@ describe("HTML sanitization", () => {
     expect(clean).not.toMatch(/script|onclick|img|javascript/i);
     expect(clean).toContain("<p>Hi</p>");
   });
+
+  it("keeps embedded signature images (data: and cid:)", () => {
+    const clean = sanitizeEmailHtml(
+      `<p>Hi</p><img src="data:image/png;base64,aaa"><img src="cid:logo@crm.local"><img src="https://track/x.gif">`,
+    );
+    expect(clean).toContain('src="data:image/png;base64,aaa"');
+    expect(clean).toContain('src="cid:logo@crm.local"');
+    expect(clean).not.toContain("https://track");
+  });
 });
 
 describe("IMAP folder discovery", () => {

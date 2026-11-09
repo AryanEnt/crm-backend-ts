@@ -49,7 +49,17 @@ import {
   type MailTransport,
   type MailboxAuth,
 } from "./mail-provider.js";
-import { applyVars, buildRfc822, findUnresolved, parseAddress, parseAddressList, parseInt64, stripTags, uniqueEmails } from "./mime.js";
+import {
+  applyVars,
+  buildRfc822,
+  findUnresolved,
+  parseAddress,
+  parseAddressList,
+  parseInt64,
+  prepareOutboundPayload,
+  stripTags,
+  uniqueEmails,
+} from "./mime.js";
 import { sanitizeEmailHtml } from "./sanitize.js";
 
 export interface EmailConfig {
@@ -1495,6 +1505,8 @@ export class EmailService {
         { account: acc.id, from: acc.emailAddress, smtpHost: settings.smtpHost, provider: acc.provider },
         "sending via mailbox SMTP",
       );
+      // data: URI images are blocked by Gmail/Outlook — rewrite to cid: inline parts.
+      const prepared = prepareOutboundPayload(m.bodyHtml, outboundAttachments);
       sent = await this.createImap(settings).send(this.mailboxAuth(acc), {
         fromName: acc.displayName,
         fromAddress: acc.emailAddress,
@@ -1502,11 +1514,11 @@ export class EmailService {
         cc: m.ccAddresses,
         bcc: m.bccAddresses,
         subject: m.subject,
-        html: m.bodyHtml,
+        html: prepared.html,
         text: m.bodyText || stripTags(m.bodyHtml),
         inReplyTo: m.inReplyTo ?? undefined,
         sentFolder: acc.imapSentFolder || undefined,
-        attachments: outboundAttachments,
+        attachments: prepared.attachments,
       });
     } catch (err) {
       const safe = classifyMailError(err);

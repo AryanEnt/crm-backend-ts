@@ -35,6 +35,8 @@ export type SendMailAttachment = {
   filename: string;
   mimeType: string;
   content: Buffer;
+  /** Inline image Content-ID (without angle brackets); referenced as cid:… in HTML. */
+  contentId?: string;
 };
 
 export type SendMailInput = {
