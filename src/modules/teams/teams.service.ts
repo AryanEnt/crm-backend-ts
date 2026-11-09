@@ -336,7 +336,7 @@ export class TeamsRepository {
       await sql`UPDATE teams SET team_lead_user_id = NULL WHERE id = ${sourceId}`.execute(tx);
       await sql`DELETE FROM team_members WHERE team_id = ${sourceId}`.execute(tx);
 
-      for (const m of members) {
+      for (const m of members.rows) {
         if (m.roleCode !== Role.SalesExecutive) continue;
         await sql`
           INSERT INTO team_members (team_id, user_id) VALUES (${destinationId}, ${m.id})
