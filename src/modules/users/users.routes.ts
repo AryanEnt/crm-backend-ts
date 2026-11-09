@@ -70,6 +70,11 @@ export function usersRouter(service: UsersService, guard: Guard): Router {
     ok(res, await service.setActive(claimsOf(req), pathParam(req, "id"), input.isActive, requestMeta(req)));
   });
 
+  router.delete("/api/v1/users/:id", ...status, async (req, res) => {
+    await service.delete(claimsOf(req), pathParam(req, "id"), requestMeta(req));
+    ok(res, { deleted: true });
+  });
+
   router.get("/api/v1/roles", ...guard(P.RolesView, P.RolesManage, P.UsersView), async (_req, res) => {
     ok(res, await service.listRoles());
   });

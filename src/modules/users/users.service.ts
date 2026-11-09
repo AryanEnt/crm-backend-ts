@@ -269,6 +269,19 @@ export class UsersRepository {
     return Number(r.numAffectedRows ?? 0n);
   }
 
+  async countActiveSuperAdmins(): Promise<number> {
+    const r = await sql<{ total: number }>`
+      SELECT COUNT(*)::int AS total
+      FROM users u JOIN roles r ON r.id = u.role_id
+      WHERE r.code = ${Role.SuperAdmin} AND u.is_active = TRUE`.execute(this.db);
+    return r.rows[0]?.total ?? 0;
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const r = await sql`DELETE FROM users WHERE id = ${id}`.execute(this.db);
+    return Number(r.numAffectedRows ?? 0n) > 0;
+  }
+
   async listRoles(): Promise<RoleInfo[] | null> {
     const r = await sql<Omit<RoleInfo, "permissions">>`
       SELECT id::text AS "id", code, name, description FROM roles ORDER BY name`.execute(this.db);
@@ -503,6 +516,34 @@ export class UsersService {
     const action = active ? "users.bulk_activated" : "users.bulk_deactivated";
     await this.audit.record(claims.userId, action, "user", null, { ids, count: n }, meta);
     return n;
+  }
+
+  /** Permanent removal. Org-scoped only — Team Leads keep deactivate. */
+  async delete(claims: Claims, id: string, meta: RequestMeta): Promise<void> {
+    const access = UserAccess.for(claims, P.UsersDelete);
+    if (!access.organization) {
+      throw AppError.forbidden("Only Super Admin can permanently delete users");
+    }
+    const current = await this.load(id);
+    access.requireManage(current);
+    if (id === claims.userId) throw AppError.validation("You can't delete your own account");
+    if (current.roleCode === Role.SuperAdmin && current.isActive) {
+      const activeAdmins = await internal("failed to check Super Admins", () => this.repo.countActiveSuperAdmins());
+      if (activeAdmins <= 1) {
+        throw AppError.conflict("Can't delete the last active Super Admin. Deactivate instead, or add another Super Admin first.");
+      }
+    }
+    await this.sessions.revokeAllUserSessions(id).catch(() => undefined);
+    const ok = await internal("failed to delete user", () => this.repo.delete(id));
+    if (!ok) throw AppError.notFound("user not found");
+    await this.audit.record(
+      claims.userId,
+      "user.deleted",
+      "user",
+      id,
+      { email: current.email, fullName: current.fullName, role: current.roleCode },
+      meta,
+    );
   }
 
   /** Permissions are expanded (:manage implies the other actions) and sorted; Go's order is random. */
