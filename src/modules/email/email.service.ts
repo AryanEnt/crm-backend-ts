@@ -171,6 +171,7 @@ export interface TemplateInput {
   name: string;
   subject: string;
   bodyHtml: string;
+  signatureHtml: string | undefined;
   category: string;
   variables: string[] | undefined;
   isActive: boolean | undefined;
@@ -1015,6 +1016,7 @@ export class EmailService {
       name: in_.name.trim(),
       subject: in_.subject,
       bodyHtml: in_.bodyHtml,
+      signatureHtml: in_.signatureHtml ?? "",
       category: in_.category !== "" ? in_.category : "general",
       variables: in_.variables ?? [],
       isActive: in_.isActive ?? true,
@@ -1030,6 +1032,7 @@ export class EmailService {
     if (in_.name.trim() !== "") t.name = in_.name.trim();
     if (in_.subject !== "") t.subject = in_.subject;
     if (in_.bodyHtml !== "") t.bodyHtml = in_.bodyHtml;
+    if (in_.signatureHtml !== undefined) t.signatureHtml = in_.signatureHtml;
     if (in_.category !== "") t.category = in_.category;
     if (in_.variables !== undefined) t.variables = in_.variables;
     if (in_.isActive !== undefined) t.isActive = in_.isActive;

@@ -67,6 +67,7 @@ const templateSchema = z.strictObject({
   name: str(),
   subject: str(),
   bodyHtml: str(),
+  signatureHtml: optionalString(),
   category: str(),
   variables: stringArray(),
   isActive: optionalBool(),

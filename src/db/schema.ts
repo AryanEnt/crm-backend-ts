@@ -443,6 +443,7 @@ export interface EmailTemplates {
   id: Generated<string>;
   is_active: Generated<boolean>;
   name: string;
+  signature_html: Generated<string>;
   subject: Generated<string>;
   team_id: string | null;
   updated_at: Generated<Timestamp>;
