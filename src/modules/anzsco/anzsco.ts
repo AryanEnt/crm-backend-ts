@@ -20,20 +20,64 @@ export interface Occupation {
 const occupationColumns = sql`id::text AS "id", code, title, occupation_group AS "occupationGroup",
   skill_level AS "skillLevel", created_at AS "createdAt"`;
 
+/** Common AU skilled-migration occupations shown when the search box is empty. */
+const POPULAR_CODES: string[] = [
+  "261313", // Software Engineer
+  "261312", // Developer Programmer
+  "261111", // ICT Business Analyst
+  "254418", // Registered Nurse (Medical)
+  "254499", // Registered Nurses (nec)
+  "351411", // Cook
+  "351311", // Chef
+  "221111", // Accountant (General)
+  "233211", // Civil Engineer
+  "233512", // Mechanical Engineer
+  "233311", // Electrical Engineer
+  "341111", // Electrician (General)
+  "331212", // Carpenter
+  "334111", // Plumber (General)
+  "321211", // Motor Mechanic (General)
+  "272511", // Social Worker
+  "252511", // Physiotherapist
+  "253111", // General Practitioner
+];
+
 export class AnzscoService {
   constructor(private readonly db: Database) {}
 
-  /** Exact code first, then code prefix, then everything else by title. */
+  /**
+   * Empty query → curated popular occupations (not A–Z dump).
+   * Otherwise rank: exact code, code prefix, title prefix, then title contains.
+   */
   async search(qRaw: string, limitRaw: number): Promise<Occupation[]> {
     const limit = limitRaw <= 0 || limitRaw > 50 ? 20 : limitRaw;
     const q = qRaw.trim();
     try {
+      if (q === "") {
+        const r = await sql<Occupation>`
+          SELECT ${occupationColumns}
+          FROM anzsco_occupations
+          WHERE code = ANY(${POPULAR_CODES}::text[])
+          ORDER BY array_position(${POPULAR_CODES}::text[], code)
+          LIMIT ${limit}`.execute(this.db);
+        return r.rows;
+      }
+
       const r = await sql<Occupation>`
         SELECT ${occupationColumns}
         FROM anzsco_occupations
-        WHERE (${q} = '' OR code ILIKE '%' || ${q} || '%' OR title ILIKE '%' || ${q} || '%'
-          OR occupation_group ILIKE '%' || ${q} || '%')
-        ORDER BY CASE WHEN code = ${q} THEN 0 WHEN code ILIKE ${q} || '%' THEN 1 ELSE 2 END, title
+        WHERE code ILIKE '%' || ${q} || '%'
+           OR title ILIKE '%' || ${q} || '%'
+           OR occupation_group ILIKE '%' || ${q} || '%'
+        ORDER BY
+          CASE
+            WHEN code = ${q} THEN 0
+            WHEN code ILIKE ${q} || '%' THEN 1
+            WHEN title ILIKE ${q} || '%' THEN 2
+            WHEN title ILIKE '% ' || ${q} || '%' THEN 3
+            ELSE 4
+          END,
+          title
         LIMIT ${limit}`.execute(this.db);
       return r.rows;
     } catch (err) {
