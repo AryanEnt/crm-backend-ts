@@ -21,7 +21,7 @@ import {
   type ThreadListFilter,
 } from "./email.repository.js";
 import { collectBodies, GmailApiError, GmailClient, googleErrorLogFields, headerValue } from "./gmail.js";
-import { ConnectLimiter } from "./connect-limiter.js";
+import { MailboxConnectLimiter } from "./connect-limiter.js";
 import {
   DomainProviderRepository,
   domainOfEmail,
@@ -240,7 +240,7 @@ export class EmailService {
   private readonly imap: MailTransport;
   private readonly createImap: (settings: ImapSmtpSettings) => MailTransport;
   private readonly lookupMx: (domain: string) => Promise<readonly MxRecord[]>;
-  private readonly connectLimiter = new ConnectLimiter(10, 15 * 60_000);
+  private readonly connectLimiter = new MailboxConnectLimiter();
   private readonly syncing = new Set<string>();
 
   constructor(
@@ -1245,7 +1245,7 @@ export class EmailService {
     in_: ImapConnectFields,
     requestId = "",
   ): Promise<{ inbox: string; sent: string; check: MailboxCheckResult }> {
-    this.connectLimiter.check(claims.userId);
+    this.connectLimiter.check("test", claims.userId, in_.emailAddress ?? "");
     const prepared = await this.prepareImapConnect(claims, in_);
     const { folders, result } = await this.checkMailbox(prepared, requestId, "test");
     return { ...folders, check: result };
@@ -1257,7 +1257,7 @@ export class EmailService {
     meta: RequestMeta,
     requestId = "",
   ): Promise<AccountPublic> {
-    this.connectLimiter.check(`${claims.userId}:connect`);
+    this.connectLimiter.check("connect", claims.userId, in_.emailAddress ?? "");
     const prepared = await this.prepareImapConnect(claims, in_);
     const { folders } = await this.checkMailbox(prepared, requestId, "connect");
     if (in_.inviteToken) {
