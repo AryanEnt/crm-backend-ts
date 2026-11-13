@@ -530,7 +530,8 @@ export class EmailRepository {
       WHERE a.provider IN ('imap','migadu','spacemail')
         AND a.encrypted_password <> ''
         AND a.connection_status IN ('connected','syncing','error')
-        AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.user_id AND u.is_active = TRUE)`.execute(this.db);
+        AND EXISTS (SELECT 1 FROM users u WHERE u.id = a.user_id AND u.is_active = TRUE)
+      ORDER BY a.last_sync_at ASC NULLS FIRST`.execute(this.db);
     return r.rows;
   }
 
