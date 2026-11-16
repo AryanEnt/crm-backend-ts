@@ -861,8 +861,6 @@ export class LeadsService {
     if (in_.fullName.trim() === "") throw AppError.validation("full name is required");
     if (in_.source.trim() === "") throw AppError.validation("lead source is required");
     if (in_.country.trim() === "") throw AppError.fieldValidation("country", "country is required");
-    if (in_.nationality.trim() === "") throw AppError.fieldValidation("nationality", "nationality is required");
-    if (in_.location.trim() === "") throw AppError.fieldValidation("location", "location is required");
     const input = { ...in_, priority: in_.priority || "medium" };
     if (!VALID_PRIORITIES.has(input.priority)) throw AppError.validation("invalid priority");
     if (isReferralSource(input.source)) {
