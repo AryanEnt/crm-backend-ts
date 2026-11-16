@@ -131,6 +131,11 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
     });
   });
 
+  router.post("/api/v1/email/team/sync-all", ...guard(P.EmailManage, P.EmailView), async (req, res) => {
+    const result = await service.syncAllTeamMailboxes(claimsOf(req));
+    ok(res, result);
+  });
+
   const inviteSchema = z.strictObject({
     invitedUserId: str(),
     emailAddress: optionalString(),

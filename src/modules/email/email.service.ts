@@ -588,6 +588,32 @@ export class EmailService {
     await this.syncAccount(acc);
   }
 
+  /** Sync every connected mailbox the caller can manage (all assigned SEs for a TL). */
+  async syncAllTeamMailboxes(claims: Claims): Promise<{
+    synced: number;
+    failed: { accountId: string; emailAddress: string; error: string }[];
+  }> {
+    const ids = assignedUserIds(claims);
+    const people = await this.repo.listAssignedPeople(ids);
+    const accounts = await this.repo.listAccountsForUsers(people.map((p) => p.userId));
+    let synced = 0;
+    const failed: { accountId: string; emailAddress: string; error: string }[] = [];
+    for (const acc of accounts) {
+      if (!canManageMailbox(claims, acc)) continue;
+      try {
+        await this.syncAccount(acc);
+        synced++;
+      } catch (err) {
+        failed.push({
+          accountId: acc.id,
+          emailAddress: acc.emailAddress,
+          error: err instanceof Error ? err.message : "Sync failed",
+        });
+      }
+    }
+    return { synced, failed };
+  }
+
   private async initialSync(accountId: string): Promise<void> {
     const acc = await this.repo.getAccount(accountId);
     if (!acc) return;
