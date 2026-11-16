@@ -303,3 +303,15 @@ describe("domain mapping admin API", () => {
     ]);
   });
 });
+
+describe("nextUidBatch", () => {
+  it("returns the next ascending batch after the cursor", async () => {
+    const { nextUidBatch } = await import("../src/modules/email/imap-smtp.js");
+    expect(nextUidBatch([9, 3, 7, 5, 7], 4, 2)).toEqual([5, 7]);
+  });
+
+  it("ignores the newest message that `N:*` returns when nothing is new", async () => {
+    const { nextUidBatch } = await import("../src/modules/email/imap-smtp.js");
+    expect(nextUidBatch([120], 120, 40)).toEqual([]);
+  });
+});

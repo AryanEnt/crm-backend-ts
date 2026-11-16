@@ -107,6 +107,14 @@ function addressText(value: { text?: string } | { text?: string }[] | undefined)
   return value.text || "";
 }
 
+/** The next `size` UIDs after `lastUid`, ascending. `N:*` always matches the newest message, even when its UID is below N. */
+export function nextUidBatch(uids: number[], lastUid: number, size: number): number[] {
+  return [...new Set(uids.map(Number))]
+    .filter((uid) => Number.isInteger(uid) && uid > lastUid)
+    .sort((a, b) => a - b)
+    .slice(0, size);
+}
+
 function asDate(value: Date | string | undefined | null, fallback: Date): Date {
   if (value instanceof Date) return value;
   if (typeof value === "string" && value) {
@@ -277,12 +285,18 @@ export class ImapSmtpTransport implements MailTransport {
         const range = lastUid > 0 ? `${lastUid + 1}:*` : "1:*";
         const messages: FetchedMail[] = [];
         let maxUid = lastUid;
-        let n = 0;
+        // Resolve the UIDs first and fetch only one batch. A FETCH cannot be cancelled, so
+        // fetching `N:*` with bodies and breaking early still downloads the whole mailbox.
+        const found = await client.search({ uid: range }, { uid: true });
+        const batchUids = nextUidBatch(Array.isArray(found) ? found : [], lastUid, FETCH_BATCH);
+        if (batchUids.length === 0) {
+          return { messages, cursor: { uidValidity, uid: lastUid }, path };
+        }
         for await (const msg of client.fetch(
-          { uid: range },
+          batchUids,
           { uid: true, envelope: true, source: true, internalDate: true },
+          { uid: true },
         )) {
-          if (n >= FETCH_BATCH) break;
           const uid = Number(msg.uid);
           if (!uid || uid <= lastUid) continue;
           const parsed = await simpleParser(msg.source ?? Buffer.alloc(0));
@@ -310,7 +324,6 @@ export class ImapSmtpTransport implements MailTransport {
             folder,
           });
           if (uid > maxUid) maxUid = uid;
-          n++;
         }
         return {
           messages,
