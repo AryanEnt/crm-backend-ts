@@ -4,15 +4,30 @@ import { fail } from "../lib/response.js";
 
 const emptyBody = new WeakSet<object>();
 
-const parseJson = express.json({
-  limit: "5mb",
-  type: () => true,
-  // Go decodes a top-level null into a struct as a no-op; other non-objects still fail in decodeJson.
-  strict: false,
-  verify: (req, _res, buf) => {
-    if (buf.toString("utf8").trim() === "") emptyBody.add(req);
-  },
-});
+function makeJsonParser(limit: string) {
+  return express.json({
+    limit,
+    type: () => true,
+    // Go decodes a top-level null into a struct as a no-op; other non-objects still fail in decodeJson.
+    strict: false,
+    verify: (req, _res, buf) => {
+      if (buf.toString("utf8").trim() === "") emptyBody.add(req);
+    },
+  });
+}
+
+const parseJson = makeJsonParser("5mb");
+/** Email compose sends attachments as base64; 15 MB file ≈ 20 MB JSON. */
+const parseJsonLarge = makeJsonParser("25mb");
+
+function wrapJson(parser: RequestHandler): RequestHandler {
+  return (req, res, next) => {
+    parser(req, res, (err?: unknown) => {
+      if (!err && emptyBody.has(req)) req.body = undefined;
+      next(err);
+    });
+  };
+}
 
 /**
  * JSON body parsing for ported routes. Like Go's DecodeJSON it ignores Content-Type,
@@ -20,12 +35,10 @@ const parseJson = express.json({
  * report "EOF" like Go. Only mounted on TypeScript routers so forwarded requests keep
  * their raw body.
  */
-export const jsonBody: RequestHandler = (req, res, next) => {
-  parseJson(req, res, (err?: unknown) => {
-    if (!err && emptyBody.has(req)) req.body = undefined;
-    next(err);
-  });
-};
+export const jsonBody: RequestHandler = wrapJson(parseJson);
+
+/** Larger JSON body for compose/send with attachments (base64). */
+export const jsonBodyLarge: RequestHandler = wrapJson(parseJsonLarge);
 
 interface RouteLayer {
   match(path: string): boolean;
@@ -77,7 +90,7 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
     return;
   }
   if (bodyError.type === "entity.too.large") {
-    fail(res, AppError.validation("invalid JSON body: request body too large"));
+    fail(res, AppError.validation("Attachments are too large for one email. Use smaller files (max 15 MB each)."));
     return;
   }
   fail(res, err);

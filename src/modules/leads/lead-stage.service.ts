@@ -215,7 +215,9 @@ export interface BoardFilter {
 
 export const BOARD_DEFAULT_LIMIT = 25;
 export const BOARD_MAX_LIMIT = 100;
-const VALID_ACTIVITY_FILTERS = new Set(["", "overdue", "today", "week", "none", "scheduled"]);
+const VALID_ACTIVITY_FILTERS = new Set(["", "overdue", "today", "week", "none", "scheduled", "stale"]);
+/** Matches lead-insights my-day / overview "stale" (quiet for 7+ days). */
+const STALE_ACTIVITY_DAYS = 7;
 
 export function parseBoardSort(raw: string): BoardSortKey {
   return (BOARD_SORT_KEYS as readonly string[]).includes(raw) ? (raw as BoardSortKey) : "days";
@@ -269,6 +271,8 @@ export function leadActivityPredicate(activity: string): Predicate | null {
       return sql`l.next_activity_at IS NULL`;
     case "scheduled":
       return sql`l.next_activity_at >= NOW()`;
+    case "stale":
+      return sql`COALESCE(l.last_activity_at, l.created_at) < NOW() - make_interval(days => ${STALE_ACTIVITY_DAYS})`;
     default:
       return null;
   }

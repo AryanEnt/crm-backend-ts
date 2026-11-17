@@ -133,6 +133,8 @@ export interface ComposeInput {
 
 const MAX_OUTBOUND_ATTACHMENTS = 10;
 const MAX_OUTBOUND_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+/** Cap total decoded size so Spacemail/Migadu message limits are less likely to reject the send. */
+const MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
 
 function parseComposeAttachments(
   raw: ComposeAttachmentInput[] | undefined,
@@ -142,6 +144,7 @@ function parseComposeAttachments(
     throw AppError.validation(`You can attach up to ${MAX_OUTBOUND_ATTACHMENTS} files`);
   }
   const out: { filename: string; mimeType: string; content: Buffer }[] = [];
+  let total = 0;
   for (const a of list) {
     const filename = (a.filename ?? "").trim() || "attachment";
     const mimeType = (a.mimeType ?? "").trim() || "application/octet-stream";
@@ -156,6 +159,10 @@ function parseComposeAttachments(
     if (content.length === 0) throw AppError.validation(`Attachment “${filename}” is empty`);
     if (content.length > MAX_OUTBOUND_ATTACHMENT_BYTES) {
       throw AppError.validation(`“${filename}” is over 15 MB`);
+    }
+    total += content.length;
+    if (total > MAX_OUTBOUND_ATTACHMENTS_TOTAL_BYTES) {
+      throw AppError.validation("Attachments together are over 20 MB. Remove some files or use smaller ones.");
     }
     out.push({ filename, mimeType, content });
   }

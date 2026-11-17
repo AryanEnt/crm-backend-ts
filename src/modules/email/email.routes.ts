@@ -7,7 +7,7 @@ import { AppError } from "../../lib/app-error.js";
 import { created, ok } from "../../lib/response.js";
 import { createRouter } from "../../lib/router.js";
 import { bool, decodeJson, optionalBool, optionalString, str, stringArray } from "../../lib/validate.js";
-import { jsonBody } from "../../middleware/errors.js";
+import { jsonBody, jsonBodyLarge } from "../../middleware/errors.js";
 import { claimsOf } from "../auth/auth.middleware.js";
 import type { Guard } from "../auth/guard.js";
 import { P } from "../permissions/permissions.js";
@@ -314,7 +314,7 @@ export function emailRouter(service: EmailService, guard: Guard): Router {
     ok(res, threadOrNull(await service.associate(claimsOf(req), pathParam(req, "id"), in_)));
   });
 
-  router.post("/api/v1/email/messages", ...guard(P.EmailSend), jsonBody, async (req, res) => {
+  router.post("/api/v1/email/messages", ...guard(P.EmailSend), jsonBodyLarge, async (req, res) => {
     const in_ = decodeJson(req, composeSchema);
     created(res, messageOrNull(await service.compose(claimsOf(req), in_, requestMetaFirstHopWithPort(req))));
   });
