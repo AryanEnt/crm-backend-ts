@@ -1,15 +1,16 @@
 import { describe, expect, it } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/app.js";
-import { P } from "../src/modules/permissions/permissions.js";
-import { bearer, config, fakeDb, queueAuth } from "./helpers.js";
+import { P, Role } from "../src/modules/permissions/permissions.js";
+import { bearer, config, queueAuth, userRow } from "./helpers/app.js";
+import { fakeDb } from "./helpers/fake-db.js";
 
 describe("lead country / nationality / location", () => {
   const body = {
     fullName: "Test Lead",
     email: "",
     phone: "",
-    phoneCountry: "AU",
+    phoneCountryCode: "AU",
     country: "",
     nationality: "",
     location: "",
@@ -18,7 +19,6 @@ describe("lead country / nationality / location", () => {
     pipelineId: "",
     stageId: "",
     source: "Other",
-    sourceDetail: "",
     priority: "medium",
     tags: [],
     anzscoId: "",
@@ -60,5 +60,16 @@ describe("lead country / nationality / location", () => {
 
     expect(res.body.error?.message ?? "").not.toMatch(/nationality is required/i);
     expect(res.body.error?.message ?? "").not.toMatch(/location is required/i);
+  });
+
+  it.each([Role.SalesManager, Role.SalesExecutive])("allows %s to create a lead without country", async (roleCode) => {
+    const f = fakeDb();
+    f.queue([userRow({ roleCode })], [{ code: P.LeadsCreate, scope: "organization" }], [], []);
+    const res = await request(createApp({ config: config(), db: f.db }))
+      .post("/api/v1/leads")
+      .set("Authorization", bearer())
+      .send(body);
+
+    expect(res.body.error?.message ?? "").not.toMatch(/country is required/i);
   });
 });
