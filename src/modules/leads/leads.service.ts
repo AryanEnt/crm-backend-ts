@@ -860,7 +860,11 @@ export class LeadsService {
     const actorId = claims.userId;
     if (in_.fullName.trim() === "") throw AppError.validation("full name is required");
     if (in_.source.trim() === "") throw AppError.validation("lead source is required");
-    if (in_.country.trim() === "") throw AppError.fieldValidation("country", "country is required");
+    // Team leads (sales_manager) and sales executives may create leads without a country.
+    const countryOptional = claims.roleCode === Role.SalesManager || claims.roleCode === Role.SalesExecutive;
+    if (!countryOptional && in_.country.trim() === "") {
+      throw AppError.fieldValidation("country", "country is required");
+    }
     const input = { ...in_, priority: in_.priority || "medium" };
     if (!VALID_PRIORITIES.has(input.priority)) throw AppError.validation("invalid priority");
     if (isReferralSource(input.source)) {
