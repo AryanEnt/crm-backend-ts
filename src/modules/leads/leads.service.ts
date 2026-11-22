@@ -1081,6 +1081,8 @@ export class LeadsService {
               fullName: name,
               email,
               phone,
+              country: in_.country !== undefined ? in_.country.trim() : cur.country,
+              nationality: in_.nationality !== undefined ? in_.nationality.trim() : cur.nationality,
               ownerUserId: pickRef(in_.ownerUserId, cur.ownerUserId),
               teamId: pickRef(in_.teamId, cur.teamId),
               pipelineId: cur.pipelineId,
