@@ -75,6 +75,8 @@ const movable = (extra: Partial<MovableLead> = {}): MovableLead => ({
   fullName: "Asha",
   email: null,
   phone: "0400",
+  country: "Australia",
+  nationality: "Australian",
   ownerUserId: "owner-1",
   teamId: "team-1",
   pipelineId: PIPE,
@@ -334,6 +336,83 @@ describe("LeadStageService.move", () => {
     );
     const out = await svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META);
     expect(out.changed).toBe(true);
+  });
+
+  it("blocks Contacted → Negotiation until country, nationality, and phone are set", async () => {
+    const CONTACTED = stage("s-contacted", "Contacted", { position: 2 });
+    const NEGOTIATION = stage("s-negotiation", "Negotiation", { position: 3 });
+    const pipe: Pipeline = {
+      ...PIPELINE,
+      stages: [CREATED, CONTACTED, NEGOTIATION, WON, LOST],
+    };
+    const pipelines = {
+      get: async (id: string) => (id === pipe.id ? pipe : null),
+      getStage: async (id: string) =>
+        [CREATED, CONTACTED, NEGOTIATION, WON, LOST, INACTIVE, FOREIGN].find((s) => s.id === id) ?? null,
+    } as unknown as PipelinesRepository;
+    const f = fakeDb();
+    const svc = new LeadStageService(f.db as unknown as Database, pipelines, null, vi.fn());
+    const ready = {
+      stageId: CONTACTED.id,
+      stageName: "Contacted",
+      contactRating: 4,
+      contactRemarks: "spoke about budget timeline and next steps",
+      nextFollowUpRemarks: "Call Thursday with fee options",
+    } as const;
+
+    f.queue([lead({ ...ready, country: "", nationality: "", phone: null })]);
+    const missing = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(missing.message).toMatch(/country, nationality, and phone/i);
+    expect(missing.details).toMatchObject({
+      reason: "negotiation_profile_required",
+      missingFields: ["country", "nationality", "phone"],
+    });
+
+    f.queue([lead({ ...ready, country: "Australia", nationality: "  ", phone: "0412 345 678" })]);
+    const nationality = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META));
+    expect(nationality.message).toMatch(/nationality/i);
+    expect(nationality.details).toMatchObject({
+      reason: "negotiation_profile_required",
+      missingFields: ["nationality"],
+    });
+
+    f.queue([lead({ ...ready, country: "", nationality: "Nepali", phone: "0412 345 678" })]);
+    const forced = await rejection(svc.move(user, "lead-1", { stageId: NEGOTIATION.id, force: true }, META));
+    expect(forced.details).toMatchObject({ reason: "negotiation_profile_required", missingFields: ["country"] });
+
+    f.queue(
+      [lead({ ...ready, country: "Australia", nationality: "Nepali", phone: "0412 345 678" })],
+      [],
+      [],
+      [],
+      [{ id: "t1", metadata: {} }],
+      [],
+      [],
+      [{ status: "open", nextActivityAt: null }],
+    );
+    const out = await svc.move(user, "lead-1", { stageId: NEGOTIATION.id }, META);
+    expect(out.changed).toBe(true);
+
+    f.queue(
+      [
+        lead({
+          ...ready,
+          stageId: CONTACTED.id,
+          country: "",
+          nationality: "",
+          phone: null,
+        }),
+      ],
+      [],
+      [],
+      [],
+      [{ id: "t1", metadata: {} }],
+      [],
+      [],
+      [{ status: "lost", nextActivityAt: null }],
+    );
+    const lost = await svc.move(user, "lead-1", { stageId: LOST.id, lostReason: "No budget" }, META);
+    expect(lost.changed).toBe(true);
   });
 
   it("blocks entering Contacted without next follow-up remarks; force cannot skip", async () => {

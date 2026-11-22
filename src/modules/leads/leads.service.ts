@@ -3,7 +3,7 @@ import { sql } from "kysely";
 import type { Database } from "../../db/database.js";
 import { AppError } from "../../lib/app-error.js";
 import { InvalidTimeError, parseDateOnly, parseOptionalTime } from "../../lib/go-time.js";
-import { internal, type RequestMeta } from "../../lib/request-meta.js";
+import { internal, isUniqueViolation, type RequestMeta } from "../../lib/request-meta.js";
 import { AttentionSql, computeAttention, validAttention } from "../attention/attention.js";
 import type { AuditService } from "../audit/audit.service.js";
 import type { Claims } from "../auth/types.js";
@@ -94,6 +94,8 @@ export interface Lead {
   documentDelayRemarksAt: Date | null;
   documentDelayRemarksBy: string | null;
   documentDelayRemarksByName: string | null;
+  /** When File Delivered email document was sent (stops overdue aging). */
+  fileDeliveredEmailSentAt: Date | null;
   stageEnteredAt: Date | null;
   daysInStage: number;
   convertedCustomerId: string | null;
@@ -295,8 +297,19 @@ const leadSelect = sql`
     l.document_delay_remarks_at AS "documentDelayRemarksAt",
     l.document_delay_remarks_by::text AS "documentDelayRemarksBy",
     dr.full_name AS "documentDelayRemarksByName",
+    l.file_delivered_email_sent_at AS "fileDeliveredEmailSentAt",
     l.stage_entered_at AS "stageEnteredAt",
-    GREATEST(0, EXTRACT(DAY FROM NOW() - COALESCE(l.stage_entered_at, l.created_at))::int) AS "daysInStage",
+    GREATEST(0, EXTRACT(DAY FROM
+      COALESCE(l.file_delivered_email_sent_at, NOW())
+      - CASE
+          WHEN lower(ps.name) IN ('file delivered', 'documents sent') THEN COALESCE(
+            (SELECT MIN(d.expires_at) FROM documents d
+              WHERE d.lead_id = l.id AND d.expires_at IS NOT NULL
+                AND d.status IN ('requested', 'missing', 'uploaded', 'expired')),
+            l.stage_entered_at, l.created_at)
+          ELSE COALESCE(l.stage_entered_at, l.created_at)
+        END
+    )::int) AS "daysInStage",
     l.converted_customer_id::text AS "convertedCustomerId", l.converted_at AS "convertedAt",
     l.is_archived AS "isArchived", l.archived_at AS "archivedAt",
     GREATEST(0, EXTRACT(DAY FROM NOW() - l.created_at)::int) AS "ageDays",
@@ -320,13 +333,15 @@ const leadSelect = sql`
   LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id`;
 
 function toLead(r: LeadRow): Lead {
+  const emailed = Boolean(r.fileDeliveredEmailSentAt);
   const attention = computeAttention({
     closed: r.isArchived || CLOSED_LEAD_STATUSES.has(r.status),
     next: r.nextActivityAt,
     last: r.lastActivityAt,
-    anchor: r.stageEnteredAt ?? r.updatedAt,
+    anchor: r.fileDeliveredEmailSentAt ?? r.stageEnteredAt ?? r.updatedAt,
     createdAt: r.createdAt,
-    slaHours: r.slaHours,
+    // File Delivered email sent: stop SLA / overdue rotting on the lead list too.
+    slaHours: emailed ? null : r.slaHours,
   });
   const ids = (r.phoneDuplicateLeadIds ?? []).map(String);
   return orderLead({
@@ -351,6 +366,7 @@ const LEAD_KEYS: (keyof Lead)[] = [
   "contactRating", "contactRemarks", "contactRatedAt", "contactRatedBy", "contactRatedByName",
   "nextFollowUpRemarks",
   "documentDelayRemarks", "documentDelayRemarksAt", "documentDelayRemarksBy", "documentDelayRemarksByName",
+  "fileDeliveredEmailSentAt",
   "stageEnteredAt", "daysInStage", "convertedCustomerId",
   "convertedAt", "isArchived", "archivedAt", "ageDays", "attention", "createdAt", "updatedAt",
   "createdByUserId", "phoneCountryCode", "phoneValidationStatus", "phoneNormalized", "phoneValidationMessage",
@@ -578,6 +594,7 @@ export class LeadsRepository {
     nextAt: Date | null,
     placement: { probability: number | null; closeDate: string | null },
     createdByUserId: string,
+    transferredFromLeadId: string | null = null,
   ): Promise<Lead | null> {
     const id = randomUUID();
     const phoneCode = (in_.phoneCountryCode ?? "").trim().toUpperCase();
@@ -588,7 +605,8 @@ export class LeadsRepository {
         pipeline_id, stage_id, notes, occupation, job_title, employer,
         experience_years, qualification, skills, potential_value, currency, probability, expected_close_at,
         expected_outcome, next_activity_at, last_activity_at, status, stage_entered_at,
-        created_by_user_id, phone_country_code, phone_validation_status, phone_validation_message
+        created_by_user_id, phone_country_code, phone_validation_status, phone_validation_message,
+        transferred_from_lead_id
       ) VALUES (
         ${id}, ${in_.fullName.trim()}, ${normalizeEmail(in_.email)}, ${normalizePhone(in_.phone)},
         ${in_.country}, ${in_.nationality}, ${in_.location},
@@ -600,7 +618,8 @@ export class LeadsRepository {
         ${in_.expectedOutcome}, ${nextAt}, NOW(), 'open', NOW(),
         ${createdByUserId}::uuid, ${phoneCode},
         ${normalizePhone(in_.phone) ? "pending" : "valid"},
-        ${normalizePhone(in_.phone) ? "Queued for validation" : ""}
+        ${normalizePhone(in_.phone) ? "Queued for validation" : ""},
+        ${transferredFromLeadId}::uuid
       )`.execute(this.db);
     return this.get(id);
   }
@@ -1192,6 +1211,164 @@ export class LeadsService {
     return result;
   }
 
+  /**
+   * Team Lead hands a Lost lead to another executive on the team as a brand-new lead: profile
+   * details are copied, the journey (stage, clock, stage-specific fields) restarts at the first
+   * open stage of the Lead Pipeline. The Lost lead stays as the record of the loss.
+   */
+  async transferLost(claims: Claims, id: string, ownerUserId: string, meta: RequestMeta): Promise<Lead> {
+    const actorId = claims.userId;
+    if (claims.roleCode !== Role.SalesManager) throw AppError.forbidden("Only Team Leads can transfer leads");
+    const cur = await this.get(id);
+    if (cur.status !== "lost") throw AppError.validation("Only Lost leads can be transferred");
+    const inTeam =
+      (cur.teamId !== null && claims.teamIds.includes(cur.teamId)) ||
+      (cur.ownerUserId !== null && claims.teamMemberUserIds.includes(cur.ownerUserId));
+    if (!inTeam) throw AppError.forbidden("lead is outside your team scope");
+
+    const targetId = ownerUserId.trim();
+    if (targetId === "") throw AppError.validation("Select an executive");
+    if (targetId === cur.ownerUserId) throw AppError.validation("Select a different executive than the current owner");
+    const target = await internal("failed to load executive", async () => {
+      const r = await sql<{ id: string; teamId: string }>`
+        SELECT u.id::text AS "id", tm.team_id::text AS "teamId"
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        JOIN team_members tm ON tm.user_id = u.id
+        WHERE u.id::text = ${targetId} AND u.is_active AND r.code = ${Role.SalesExecutive}
+          AND tm.team_id = ANY(${claims.teamIds}::uuid[])
+        ORDER BY (tm.team_id::text = ${cur.teamId ?? ""}) DESC
+        LIMIT 1`.execute(this.db);
+      return r.rows[0] ?? null;
+    });
+    if (!target) throw AppError.validation("Select an active executive from your team");
+
+    const already = await internal("failed to check transfer", () =>
+      sql<{ id: string }>`SELECT id::text AS "id" FROM leads WHERE transferred_from_lead_id = ${id}::uuid`.execute(this.db),
+    );
+    if (already.rows.length > 0) throw AppError.conflict("This lead has already been transferred");
+
+    const placement = await this.stages.defaultPlacement();
+    if (!placement) throw AppError.validation("The Lead Pipeline has no open stage");
+
+    const input: CreateLeadInput = {
+      fullName: cur.fullName,
+      email: cur.email ?? undefined,
+      phone: cur.phone ?? undefined,
+      phoneCountryCode: cur.phoneCountryCode,
+      country: cur.country,
+      nationality: cur.nationality,
+      location: cur.location,
+      ownerUserId: target.id,
+      teamId: target.teamId,
+      source: cur.source,
+      priority: cur.priority,
+      tags: cur.tags,
+      anzscoId: cur.anzscoId ?? undefined,
+      pipelineId: placement.pipelineId,
+      stageId: placement.stage.id,
+      notes: cur.notes,
+      occupation: cur.occupation,
+      jobTitle: cur.jobTitle,
+      employer: cur.employer,
+      experienceYears: cur.experienceYears ?? undefined,
+      qualification: cur.qualification,
+      skills: cur.skills,
+      potentialValue: cur.potentialValue ?? undefined,
+      currency: cur.currency,
+      expectedOutcome: cur.expectedOutcome,
+      forceCreate: true,
+    };
+    const lead = await internal("failed to transfer lead", async () => {
+      try {
+        const l = await this.repo.create(input, null, { probability: placement.stage.probability, closeDate: null }, actorId, id);
+        if (!l) throw new Error("transferred lead not found");
+        return l;
+      } catch (err) {
+        if (isUniqueViolation(err)) throw AppError.conflict("This lead has already been transferred");
+        throw err;
+      }
+    });
+    await this.stages.recordInitialStage(lead.id, placement.pipelineId, placement.stage, actorId, {
+      kind: "transferred",
+      fromLeadId: id,
+    });
+
+    const referral = isReferralSource(cur.source) ? await this.referrals.getForLead(id).catch(() => null) : null;
+    if (referral) {
+      await this.referrals
+        .attachToLead(
+          actorId,
+          lead.id,
+          {
+            referrerTypeCode: referral.referrerTypeCode,
+            referrerUserId: referral.referrerUserId ?? undefined,
+            referrerCustomerId: referral.referrerCustomerId ?? undefined,
+            referrerPartnerId: referral.referrerPartnerId ?? undefined,
+            referrerName: referral.referrerName,
+            relationshipCode: referral.relationshipCode ?? undefined,
+            referralDate: referral.referralDate || undefined,
+            referralSource: referral.referralSource,
+            notes: referral.notes,
+            referralCode: referral.referralCode ?? undefined,
+            statusCode: referral.statusCode,
+          },
+          meta,
+        )
+        .catch(() => undefined);
+    }
+    const customValues = await this.customFields.getValues("lead", id).catch(() => ({}));
+    if (Object.keys(customValues).length > 0) {
+      await this.customFields.setValues(actorId, "lead", lead.id, customValues).catch(() => undefined);
+    }
+
+    const details = { fromLeadId: id, toLeadId: lead.id, fromOwnerUserId: cur.ownerUserId, ownerUserId: target.id };
+    await this.audit.record(actorId, "lead.transferred", "lead", id, details, meta);
+    await this.audit.record(actorId, "lead.created", "lead", lead.id, { fullName: lead.fullName, source: lead.source, transferredFromLeadId: id }, meta);
+    await this.timeline.record({
+      eventType: TimelineEvent.AssignmentChange,
+      title: "Lead transferred",
+      body: `Transferred to ${lead.ownerName ?? "another executive"} as a new lead`,
+      actorUserId: actorId,
+      source: "crm",
+      leadId: id,
+      metadata: details,
+    });
+    await this.timeline.record({
+      eventType: TimelineEvent.LeadCreated,
+      title: "Lead created",
+      body: `${lead.fullName} · transferred from a Lost lead`,
+      actorUserId: actorId,
+      source: "crm",
+      leadId: lead.id,
+      metadata: { source: lead.source, transferredFromLeadId: id },
+    });
+    await this.hooks.emit(AutomationEvent.LeadCreated, "lead", lead.id, {
+      fullName: lead.fullName,
+      source: lead.source,
+      priority: lead.priority,
+      pipelineId: lead.pipelineId,
+      stageId: lead.stageId,
+      ownerUserId: lead.ownerUserId,
+      transferredFromLeadId: id,
+    });
+    await this.sysActivity.record({
+      eventType: "lead.transferred",
+      title: "Lead transferred",
+      actorUserId: actorId,
+      entityType: "lead",
+      entityId: lead.id,
+      entityLabel: lead.fullName,
+      metadata: details,
+    });
+
+    const phoneMarked = await this.phones.markPending(lead.id, lead.phone, lead.phoneCountryCode, lead.country);
+    if (phoneMarked.enqueue) enqueuePhoneValidation(this.phones, lead.id, phoneMarked.version);
+
+    const [enriched] = await this.attachVisibleDuplicates([await this.get(lead.id)], claims);
+    return enriched ?? lead;
+  }
+
   async checkDuplicates(
     claims: Claims,
     excludeId: string,
@@ -1211,13 +1388,50 @@ export class LeadsService {
         SELECT EXISTS (
           SELECT 1
           FROM documents d
+          JOIN leads l ON l.id = d.lead_id
           WHERE d.lead_id = ${leadId}::uuid
+            AND l.file_delivered_email_sent_at IS NULL
             AND d.expires_at IS NOT NULL
             AND d.expires_at < NOW()
             AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
         ) AS overdue`.execute(this.db),
     );
     return Boolean(r.rows[0]?.overdue);
+  }
+
+  /**
+   * Marks the File Delivered stage email as sent: freezes overdue aging so the board
+   * shows green and stops accumulating overdue days (due date remains for context).
+   */
+  async markFileDeliveredEmailSent(
+    claims: Claims,
+    leadId: string,
+    meta: RequestMeta,
+  ): Promise<Lead> {
+    const lead = await this.get(leadId);
+    const stageName = (lead.stageName ?? "").trim().toLowerCase();
+    if (stageName !== "file delivered" && stageName !== "documents sent") {
+      throw AppError.validation("Lead must be in File Delivered to mark the email as sent");
+    }
+    if (lead.fileDeliveredEmailSentAt) return lead;
+    const now = new Date();
+    await internal("failed to mark file-delivered email sent", () =>
+      sql`
+        UPDATE leads SET
+          file_delivered_email_sent_at = ${now},
+          updated_at = ${now}
+        WHERE id = ${leadId}::uuid
+          AND file_delivered_email_sent_at IS NULL`.execute(this.db),
+    );
+    await this.audit.record(
+      claims.userId,
+      "lead.file_delivered_email_sent",
+      "lead",
+      leadId,
+      {},
+      meta,
+    );
+    return this.get(leadId);
   }
 
   async listDocumentDelayRemarks(leadId: string): Promise<DocumentDelayRemark[]> {

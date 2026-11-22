@@ -338,6 +338,15 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
     },
   );
 
+  router.post(
+    "/api/v1/leads/:id/file-delivered-email-sent",
+    ...guard(...edit),
+    inScope(db, Records.Leads, edit),
+    async (req, res) => {
+      ok(res, await service.markFileDeliveredEmailSent(claimsOf(req), pathParam(req, "id"), requestMeta(req)));
+    },
+  );
+
   router.patch("/api/v1/leads/:id", ...guard(...edit), inScope(db, Records.Leads, edit), jsonBody, async (req, res) => {
     const input = decodeJson(req, updateSchema);
     sendWriteResult(res, await service.update(claimsOf(req), pathParam(req, "id"), input, requestMeta(req)), 200);
@@ -353,6 +362,11 @@ export function leadsRouter(service: LeadsService, db: Database, guard: Guard): 
       needsNextActivity: outcome.needsNextActivity,
       ...(outcome.nextActivityId !== undefined ? { nextActivityId: outcome.nextActivityId } : {}),
     });
+  });
+
+  router.post("/api/v1/leads/:id/transfer", ...guard(...edit), inScope(db, Records.Leads, edit), jsonBody, async (req, res) => {
+    const { ownerUserId } = decodeJson(req, z.strictObject({ ownerUserId: str() }));
+    created(res, await service.transferLost(claimsOf(req), pathParam(req, "id"), ownerUserId, requestMeta(req)));
   });
 
   router.post("/api/v1/leads/:id/qualify", ...guard(...edit), inScope(db, Records.Leads, edit), async (req, res) => {
