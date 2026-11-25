@@ -529,6 +529,7 @@ export interface Leads {
   status: Generated<string>;
   tags: Generated<string[]>;
   team_id: string | null;
+  transferred_from_lead_id: string | null;
   updated_at: Generated<Timestamp>;
   won_at: Timestamp | null;
 }

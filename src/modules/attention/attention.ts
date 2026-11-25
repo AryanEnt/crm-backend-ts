@@ -43,14 +43,25 @@ export function validAttention(code: string): boolean {
   return code === "" || (Object.values(Attention) as string[]).includes(code);
 }
 
+/** File Delivered stage age starts at the open document due date (not stage entry). */
+const LEAD_SLA_ANCHOR = `CASE
+    WHEN l.file_delivered_email_sent_at IS NOT NULL THEN l.file_delivered_email_sent_at
+    WHEN lower(COALESCE(ps.name, '')) IN ('file delivered', 'documents sent') THEN COALESCE(
+      (SELECT MIN(d.expires_at) FROM documents d
+        WHERE d.lead_id = l.id AND d.expires_at IS NOT NULL
+          AND d.status IN ('requested', 'missing', 'uploaded', 'expired')),
+      l.stage_entered_at, l.updated_at)
+    ELSE COALESCE(l.stage_entered_at, l.updated_at)
+  END`;
+
 /** SQL equivalents. Queries must use the documented aliases and join pipeline_stages as ps where mentioned. */
 export const AttentionSql = {
   lead: `CASE
     WHEN l.status IN ('won','lost','converted','archived','unqualified') OR l.is_archived THEN ''
     WHEN l.next_activity_at IS NULL THEN 'no_next_activity'
     WHEN l.next_activity_at <= NOW() THEN 'overdue_next'
-    WHEN ps.sla_hours IS NOT NULL AND ps.sla_hours > 0 AND EXTRACT(EPOCH FROM (NOW() - COALESCE(l.stage_entered_at, l.updated_at))) / 3600 > ps.sla_hours THEN 'over_sla'
-    WHEN ps.sla_hours IS NOT NULL AND ps.sla_hours > 0 AND EXTRACT(EPOCH FROM (NOW() - COALESCE(l.stage_entered_at, l.updated_at))) / 3600 > ps.sla_hours * 0.8 THEN 'attention_needed'
+    WHEN l.file_delivered_email_sent_at IS NULL AND ps.sla_hours IS NOT NULL AND ps.sla_hours > 0 AND EXTRACT(EPOCH FROM (NOW() - (${LEAD_SLA_ANCHOR}))) / 3600 > ps.sla_hours THEN 'over_sla'
+    WHEN l.file_delivered_email_sent_at IS NULL AND ps.sla_hours IS NOT NULL AND ps.sla_hours > 0 AND EXTRACT(EPOCH FROM (NOW() - (${LEAD_SLA_ANCHOR}))) / 3600 > ps.sla_hours * 0.8 THEN 'attention_needed'
     WHEN COALESCE(l.last_activity_at, l.created_at) < NOW() - INTERVAL '7 days' THEN 'no_recent_activity'
     ELSE ''
   END`,

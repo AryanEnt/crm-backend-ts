@@ -46,20 +46,42 @@ export async function findSlaBreaches(db: Database, limit = 200): Promise<SlaBre
       ou.full_name AS "ownerName",
       t.team_lead_user_id::text AS "teamLeadUserId",
       ps.sla_hours AS "slaHours",
-      EXTRACT(EPOCH FROM (NOW() - COALESCE(l.stage_entered_at, l.updated_at))) / 3600.0 AS "hoursInStage",
-      COALESCE(l.stage_entered_at, l.updated_at) AS "stageEnteredAt"
+      EXTRACT(EPOCH FROM (NOW() - CASE
+        WHEN lower(COALESCE(ps.name, '')) IN ('file delivered', 'documents sent') THEN COALESCE(
+          (SELECT MIN(d.expires_at) FROM documents d
+            WHERE d.lead_id = l.id AND d.expires_at IS NOT NULL
+              AND d.status IN ('requested', 'missing', 'uploaded', 'expired')),
+          l.stage_entered_at, l.updated_at)
+        ELSE COALESCE(l.stage_entered_at, l.updated_at)
+      END)) / 3600.0 AS "hoursInStage",
+      CASE
+        WHEN lower(COALESCE(ps.name, '')) IN ('file delivered', 'documents sent') THEN COALESCE(
+          (SELECT MIN(d.expires_at) FROM documents d
+            WHERE d.lead_id = l.id AND d.expires_at IS NOT NULL
+              AND d.status IN ('requested', 'missing', 'uploaded', 'expired')),
+          l.stage_entered_at, l.updated_at)
+        ELSE COALESCE(l.stage_entered_at, l.updated_at)
+      END AS "stageEnteredAt"
     FROM leads l
     INNER JOIN pipeline_stages ps ON ps.id = l.stage_id
     LEFT JOIN users ou ON ou.id = l.owner_user_id
     LEFT JOIN teams t ON t.id = l.team_id
     WHERE l.is_archived = FALSE
       AND l.status NOT IN ('won', 'lost', 'converted', 'archived', 'unqualified')
+      AND l.file_delivered_email_sent_at IS NULL
       AND COALESCE(ps.is_won, FALSE) = FALSE
       AND COALESCE(ps.is_lost, FALSE) = FALSE
       AND ps.sla_hours IS NOT NULL
       AND ps.sla_hours > 0
       AND l.stage_id IS NOT NULL
-      AND EXTRACT(EPOCH FROM (NOW() - COALESCE(l.stage_entered_at, l.updated_at))) / 3600.0 >= ps.sla_hours
+      AND EXTRACT(EPOCH FROM (NOW() - CASE
+        WHEN lower(COALESCE(ps.name, '')) IN ('file delivered', 'documents sent') THEN COALESCE(
+          (SELECT MIN(d.expires_at) FROM documents d
+            WHERE d.lead_id = l.id AND d.expires_at IS NOT NULL
+              AND d.status IN ('requested', 'missing', 'uploaded', 'expired')),
+          l.stage_entered_at, l.updated_at)
+        ELSE COALESCE(l.stage_entered_at, l.updated_at)
+      END)) / 3600.0 >= ps.sla_hours
     ORDER BY COALESCE(l.stage_entered_at, l.updated_at) ASC
     LIMIT ${limit}`.execute(db);
   return r.rows;

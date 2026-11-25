@@ -14,6 +14,11 @@ import type { Pipeline, PipelinesRepository, Stage } from "../pipelines/pipeline
 import { AttentionSql, validAttention } from "../attention/attention.js";
 import { TimelineEvent, TimelineService } from "../timeline/timeline.service.js";
 import { contactRemarksProblem, isContactedStage, parseContactRating } from "./contact-rating.js";
+import {
+  isNegotiationStage,
+  missingNegotiationProfileFields,
+  negotiationProfileProblem,
+} from "./negotiation-profile.js";
 import { nextFollowUpRemarksProblem, requiresNextFollowUpRemarks } from "./next-follow-up-remarks.js";
 
 /** The lead fields stage requirements and move rules look at. */
@@ -22,6 +27,8 @@ export interface MovableLead {
   fullName: string;
   email: string | null;
   phone: string | null;
+  country: string;
+  nationality: string;
   ownerUserId: string | null;
   teamId: string | null;
   pipelineId: string | null;
@@ -156,6 +163,11 @@ export interface BoardCard {
   /** Latest overdue document-delay remark (empty when none). */
   documentDelayRemarks: string;
   documentDelayRemarksAt: Date | null;
+  /** When File Delivered email document was sent (stops overdue aging). */
+  fileDeliveredEmailSentAt: Date | null;
+  /** Lost leads only: the new lead a Team Lead transferred this one into. */
+  transferredToLeadId: string | null;
+  transferredToOwnerName: string | null;
 }
 
 export interface BoardStage {
@@ -389,9 +401,19 @@ const MOVABLE_SELECT = sql`
     CASE WHEN l.expected_close_at IS NULL THEN NULL ELSE to_char(l.expected_close_at, 'YYYY-MM-DD') END AS "expectedCloseAt",
     l.status, l.is_archived AS "isArchived", l.stage_entered_at AS "stageEnteredAt", l.created_at AS "createdAt",
     l.contact_rating AS "contactRating", COALESCE(l.contact_remarks, '') AS "contactRemarks",
-    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks"
+    COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
+    COALESCE(l.country, '') AS "country", COALESCE(l.nationality, '') AS "nationality"
   FROM leads l
   LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id`;
+
+const TRANSFER_JOIN = sql`
+  LEFT JOIN LATERAL (
+    SELECT n.id::text AS id, nu.full_name AS owner_name
+    FROM leads n
+    LEFT JOIN users nu ON nu.id = n.owner_user_id
+    WHERE n.transferred_from_lead_id = l.id
+    LIMIT 1
+  ) tr ON TRUE`;
 
 /**
  * The single implementation of lead stage changes. Every path that changes leads.stage_id
@@ -441,10 +463,16 @@ export class LeadStageService {
   }
 
   /** Records the first stage entry of a freshly created lead (best effort, like the deal create). */
-  async recordInitialStage(leadId: string, pipelineId: string, stage: Stage, actorUserId: string | null): Promise<void> {
+  async recordInitialStage(
+    leadId: string,
+    pipelineId: string,
+    stage: Stage,
+    actorUserId: string | null,
+    metadata: Record<string, unknown> = { kind: "created" },
+  ): Promise<void> {
     await sql`
       INSERT INTO lead_stage_transitions (id, lead_id, to_pipeline_id, to_stage_id, actor_user_id, metadata)
-      VALUES (${randomUUID()}, ${leadId}, ${pipelineId}, ${stage.id}, ${actorUserId}, ${JSON.stringify({ kind: "created" })}::jsonb)`
+      VALUES (${randomUUID()}, ${leadId}, ${pipelineId}, ${stage.id}, ${actorUserId}, ${JSON.stringify(metadata)}::jsonb)`
       .execute(this.db)
       .catch(() => undefined);
   }
@@ -600,6 +628,22 @@ export class LeadStageService {
         throw AppError.validation(followUpIssue, {
           reason: "next_follow_up_remarks_required",
           missingFields: ["next_follow_up_remarks"],
+          missingActivities: [],
+          missingDocuments: [],
+          stageId: toStage.id,
+          stageName: toStage.name,
+        });
+      }
+    }
+
+    // Contacted → Negotiation need country, nationality, and phone (hard gate — force does not skip).
+    if (isContactedStage(lead.stageName) && isNegotiationStage(toStage.name)) {
+      const missingProfile = missingNegotiationProfileFields(lead);
+      const profileIssue = negotiationProfileProblem(missingProfile);
+      if (profileIssue) {
+        throw AppError.validation(profileIssue, {
+          reason: "negotiation_profile_required",
+          missingFields: missingProfile,
           missingActivities: [],
           missingDocuments: [],
           stageId: toStage.id,
@@ -992,6 +1036,8 @@ export class LeadStageService {
           dd.deadline AS "documentDeadlineAt",
           COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
           l.document_delay_remarks_at AS "documentDelayRemarksAt",
+          l.file_delivered_email_sent_at AS "fileDeliveredEmailSentAt",
+          tr.id AS "transferredToLeadId", tr.owner_name AS "transferredToOwnerName",
           ROW_NUMBER() OVER (
             PARTITION BY l.stage_id ORDER BY ${orderBy}
           ) AS rn
@@ -1013,6 +1059,7 @@ export class LeadStageService {
             AND d.expires_at IS NOT NULL
             AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
         ) dd ON TRUE
+        ${TRANSFER_JOIN}
         WHERE ${and(where)}
       ) ranked
       WHERE rn > ${offset} AND rn <= ${offset + perStage}
@@ -1045,7 +1092,9 @@ export class LeadStageService {
         COALESCE(l.next_follow_up_remarks, '') AS "nextFollowUpRemarks",
         dd.deadline AS "documentDeadlineAt",
         COALESCE(l.document_delay_remarks, '') AS "documentDelayRemarks",
-        l.document_delay_remarks_at AS "documentDelayRemarksAt"
+        l.document_delay_remarks_at AS "documentDelayRemarksAt",
+        l.file_delivered_email_sent_at AS "fileDeliveredEmailSentAt",
+        tr.id AS "transferredToLeadId", tr.owner_name AS "transferredToOwnerName"
       FROM leads l
       LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
       LEFT JOIN users ou ON ou.id = l.owner_user_id
@@ -1064,6 +1113,7 @@ export class LeadStageService {
           AND d.expires_at IS NOT NULL
           AND d.status IN ('requested', 'missing', 'uploaded', 'expired')
       ) dd ON TRUE
+      ${TRANSFER_JOIN}
       WHERE ${and(where)}
       ORDER BY ${orderBy}
       LIMIT ${limit} OFFSET ${offset}`.execute(this.db);
